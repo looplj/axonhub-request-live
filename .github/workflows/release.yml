@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test
+        run: node --test format.test.mjs
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+
+      - name: Install pack-plugin
+        run: go install github.com/looplj/axonhub/cmd/pack-plugin@unstable
+
+      - name: Set manifest version from tag
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python3 - "$version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+              raise SystemExit(f"ref name is not a semantic version: {version}")
+          path = Path("manifest.json")
+          text = path.read_text()
+          new, count = re.subn(
+              r'("version"\s*:\s*")[^"]*"',
+              lambda match: f'{match.group(1)}{version}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("manifest.json has no version field")
+          path.write_text(new)
+          print(f"manifest version set to {version}")
+          PY
+          git add manifest.json
+
+      - name: Commit manifest version
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "manifest version already matches the tag"
+          else
+            git commit -m "chore: update manifest version to ${GITHUB_REF_NAME#v} [skip ci]"
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          fi
+
+      - name: Pack
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="${RUNNER_TEMP}/plugin"
+          mkdir -p "$stage"
+          cp manifest.json "$stage/"
+          cp -R ui "$stage/"
+          asset="${RUNNER_TEMP}/request-live-${version}.axplugin"
+          pack-plugin "$stage" -o "$asset"
+          sha256sum "$asset" | tee "${RUNNER_TEMP}/checksums.txt"
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # Creating the Release on GitHub pushes the tag and starts this
+          # workflow, so the Release usually already exists. Attach the build
+          # there and leave the title and notes alone.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; uploading assets"
+            gh release upload "$tag" \
+              "$ASSET" \
+              "${RUNNER_TEMP}/checksums.txt" \
+              --clobber
+            exit 0
+          fi
+          notes="${RUNNER_TEMP}/notes.md"
+          {
+            echo "Request Live ${tag}"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/checksums.txt"
+            echo '```'
+          } > "$notes"
+          gh release create "$tag" \
+            "$ASSET" \
+            "${RUNNER_TEMP}/checksums.txt" \
+            --title "$tag" \
+            --notes-file "$notes"
