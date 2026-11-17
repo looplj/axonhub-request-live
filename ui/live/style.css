@@ -118,6 +118,8 @@ h2 {
   pointer-events: none;
 }
 
+.limit select { min-width: 96px; }
+
 select {
   appearance: none;
   height: 34px;
@@ -207,6 +209,16 @@ select:focus-visible, .segmented button:focus-visible, tbody tr:focus-visible {
 .panel-hint { color: var(--muted-foreground, #5e6772); font-size: 12px; }
 
 /* stats */
+
+.stats-block { display: grid; gap: 8px; }
+
+.stats-block > [hidden] { display: none; }
+
+.sample-note {
+  margin: 0;
+  color: var(--muted-foreground, #5e6772);
+  font-size: 12px;
+}
 
 .stats {
   display: grid;

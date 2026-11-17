@@ -17,6 +17,8 @@ const HUB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
 // Where a waiting dot rests: on the wire, just short of the node it waits at.
 const HOLD_GAP = 11;
 const LIVE_MS = 15 * 60 * 1000;
+const LIMITS = [25, 50, 100, 200];
+const DEFAULT_LIMIT = 50;
 const OUT_MS = 1100;
 const BACK_MS = 1100;
 const SWITCH_MS = 480;
@@ -36,6 +38,11 @@ const COPY = {
     requests: "请求",
     inFlight: "进行中",
     failed: "失败",
+    limit: "条数",
+    limitOption: (count) => `${count} 条`,
+    sampleStats: (count) => `最新 ${count} 条中`,
+    listSample: (count) => `列表为最新 ${count} 条`,
+    emptyFilterSample: (count) => `最新 ${count} 条里没有这个客户端的请求。`,
     noKey: "无密钥",
     unassigned: "未关联",
     time: "时间",
@@ -84,6 +91,11 @@ const COPY = {
     requests: "Requests",
     inFlight: "In flight",
     failed: "Failed",
+    limit: "Rows",
+    limitOption: (count) => `${count} rows`,
+    sampleStats: (count) => `Latest ${count}`,
+    listSample: (count) => `List shows the latest ${count}`,
+    emptyFilterSample: (count) => `No requests for this client in the latest ${count}.`,
     noKey: "No API key",
     unassigned: "Unassigned",
     time: "Time",
@@ -125,6 +137,8 @@ const LIST_FIELDS = `id createdAt updatedAt status modelID stream source userAge
 const titleEl = document.querySelector("#title");
 const filterLabel = document.querySelector("#filter-label");
 const filterEl = document.querySelector("#client-filter");
+const limitLabel = document.querySelector("#limit-label");
+const limitEl = document.querySelector("#limit");
 const toggleEl = document.querySelector("#window-toggle");
 const updatedEl = document.querySelector("#updated");
 const hintEl = document.querySelector("#hint");
@@ -137,6 +151,8 @@ const tickEl = document.querySelector("#tick");
 const summaryEl = document.querySelector("#summary");
 const focusBar = document.querySelector("#focus-bar");
 const focusTag = document.querySelector("#focus-tag");
+const statsBlock = document.querySelector("#stats-block");
+const sampleNoteEl = document.querySelector("#sample-note");
 const countsEl = document.querySelector("#counts");
 const logPanel = document.querySelector("#log-panel");
 const logTitle = document.querySelector("#log-title");
@@ -160,11 +176,15 @@ toggleEl.append(liveButton, todayButton);
 let locale = document.documentElement.lang || "en";
 let text = copy(locale);
 let mode = "live";
+let limit = DEFAULT_LIMIT;
+let fetchedLimit = DEFAULT_LIMIT;
+let fetchedMode = "live";
 let clientFilter = "all";
 let pinned = false;
 let pinId = "";
 let namesDenied = false;
 let latestRequests = [];
+let latestTotals = null;
 let fetchedAt = null;
 let hasInFlight = false;
 let loadedOnce = false;
@@ -228,6 +248,7 @@ function applyStaticCopy() {
   todayButton.textContent = text.today;
   toggleEl.setAttribute("aria-label", `${text.live} / ${text.today}`);
   paintToggle();
+  fillLimit();
   if (!fetchedAt) updatedEl.textContent = text.loading;
   if (!hintEl.hidden) hintEl.textContent = text.channelHint;
 }
@@ -250,6 +271,13 @@ function wireControls() {
   filterEl.addEventListener("change", () => {
     clientFilter = filterEl.value || "all";
     if (loadedOnce) render({ loaded: true });
+  });
+  limitEl.addEventListener("change", () => {
+    const next = clampLimit(limitEl.value);
+    limitEl.value = String(next);
+    if (next === limit) return;
+    limit = next;
+    poll();
   });
   toggleEl.addEventListener("click", (event) => {
     const button = event.target.closest("button");
@@ -286,6 +314,24 @@ function paintToggle() {
   todayButton.setAttribute("aria-pressed", mode === "today" ? "true" : "false");
 }
 
+function fillLimit() {
+  limitLabel.textContent = text.limit;
+  limitEl.setAttribute("aria-label", text.limit);
+  limitEl.replaceChildren();
+  for (const value of LIMITS) {
+    const option = document.createElement("option");
+    option.value = String(value);
+    option.textContent = text.limitOption(value);
+    limitEl.append(option);
+  }
+  limitEl.value = String(limit);
+}
+
+function clampLimit(value) {
+  const number = Number(value);
+  return LIMITS.includes(number) ? number : DEFAULT_LIMIT;
+}
+
 function poll() {
   clearTimeout(timer);
   timer = 0;
@@ -318,11 +364,12 @@ function schedule() {
 async function load(gen) {
   const now = new Date();
   const since = sinceFor(mode, now).toISOString();
-  let list = await bridge.graphql(listQuery(!namesDenied), { since });
+  const first = clampLimit(limit);
+  let list = await bridge.graphql(listQuery(!namesDenied), { since, first });
   if (gen !== generation) return;
   if (!namesDenied && channelSelectionForbidden(list && list.errors)) {
     namesDenied = true;
-    list = await bridge.graphql(listQuery(false), { since });
+    list = await bridge.graphql(listQuery(false), { since, first });
     if (gen !== generation) return;
   }
   showHint(namesDenied);
@@ -331,6 +378,7 @@ async function load(gen) {
     return;
   }
   let requests = nodesOf(list.data.requests).map(mapRequest).filter(Boolean);
+  const totals = readTotals(list.data);
   const preliminary = buildStage({
     requests,
     now,
@@ -338,6 +386,8 @@ async function load(gen) {
     focusId: pinId,
     pinned,
     clientFilter,
+    limit: first,
+    totals,
   });
   const ids = executionIds(requests, preliminary.focusId);
   let executionErrors = [];
@@ -356,23 +406,46 @@ async function load(gen) {
   if (gen !== generation) return;
   showProblems([...(list.errors || []), ...executionErrors], false);
   latestRequests = requests;
+  latestTotals = totals;
+  fetchedLimit = first;
+  fetchedMode = mode;
   fetchedAt = now;
-  hasInFlight = requests.some((item) => item.status === "pending" || item.status === "processing");
+  hasInFlight = (totals ? totals.inFlight > 0 : false)
+    || requests.some((item) => item.status === "pending" || item.status === "processing");
   render({ loaded: true });
   paintTick(true);
 }
 
 function listQuery(withChannel) {
   const channel = withChannel ? "channel { id name }" : "channelID";
-  return `query LiveRequests($since: Time!) {
+  // Pending and processing requests stay in every window, including ones
+  // that started before $since. Finished rows are limited to the window.
+  const windowWhere = `{ or: [ { statusIn: [pending, processing] }, { createdAtGTE: $since } ] }`;
+  return `query LiveRequests($since: Time!, $first: Int!) {
     requests(
-      first: 40
+      first: $first
       orderBy: { field: CREATED_AT, direction: DESC }
-      where: { or: [ { statusIn: [pending, processing] }, { createdAtGTE: $since } ] }
+      where: ${windowWhere}
     ) {
+      totalCount
       edges { node { ${LIST_FIELDS} ${channel} } }
     }
+    inFlight: requests(first: 0, where: { statusIn: [pending, processing] }) { totalCount }
+    failed: requests(first: 0, where: { and: [ { status: failed }, { createdAtGTE: $since } ] }) { totalCount }
   }`;
+}
+
+function readTotals(data) {
+  const requests = countOf(data && data.requests);
+  const inFlight = countOf(data && data.inFlight);
+  const failed = countOf(data && data.failed);
+  if (requests == null || inFlight == null || failed == null) return null;
+  return { requests, inFlight, failed };
+}
+
+function countOf(connection) {
+  const value = connection && connection.totalCount;
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function executionsQuery(ids, withChannel) {
@@ -527,6 +600,8 @@ function render(options) {
     focusId: pinId,
     pinned,
     clientFilter,
+    limit: fetchedLimit,
+    totals: mode === fetchedMode ? latestTotals : null,
   });
   if (pinned && view.focusId !== pinId) {
     pinned = false;
@@ -546,11 +621,11 @@ function render(options) {
 function paintChrome(view) {
   fillFilter(view.availableClients);
   updatedEl.textContent = fetchedAt ? text.updated(formatTime(fetchedAt, locale)) : text.loading;
-  const empty = view.counts.requests === 0;
+  const empty = view.shown === 0;
   emptyEl.hidden = !empty;
   emptyText.textContent = view.windowCount === 0
     ? (mode === "today" ? text.emptyToday : text.emptyLive)
-    : text.emptyFilter;
+    : (view.note && view.note.kind === "sample" ? text.emptyFilterSample(view.note.count) : text.emptyFilter);
   paintStats(view, empty);
   paintFocusBar(view, empty);
   logPanel.hidden = empty;
@@ -558,8 +633,13 @@ function paintChrome(view) {
 }
 
 function paintStats(view, empty) {
-  countsEl.hidden = empty;
+  statsBlock.hidden = empty;
   if (empty) return;
+  const note = view.note;
+  sampleNoteEl.hidden = !note;
+  sampleNoteEl.textContent = note
+    ? (note.kind === "list" ? text.listSample(note.count) : text.sampleStats(note.count))
+    : "";
   countsEl.replaceChildren(
     stat(text.requests, view.counts.requests, ""),
     stat(text.inFlight, view.counts.inFlight, view.counts.inFlight ? "busy" : ""),
@@ -632,7 +712,7 @@ function fillFilter(clients) {
 }
 
 function paintStage(view, event) {
-  const empty = view.counts.requests === 0;
+  const empty = view.shown === 0;
   stage.hidden = empty;
   stageScroll.hidden = empty;
   if (empty) {
@@ -833,7 +913,7 @@ function flashing(rowId) {
 function paintLog(view) {
   const scroll = logWrap.scrollTop;
   logWrap.replaceChildren();
-  if (!view.counts.requests) return;
+  if (!view.shown) return;
   const table = document.createElement("table");
   const head = document.createElement("thead");
   const headRow = document.createElement("tr");

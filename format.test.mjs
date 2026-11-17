@@ -47,6 +47,8 @@ function stage(requests, extra) {
     focusId: extra.focusId ?? null,
     pinned: extra.pinned ?? false,
     clientFilter: extra.clientFilter ?? "all",
+    limit: extra.limit,
+    totals: extra.totals,
   });
 }
 
@@ -389,6 +391,90 @@ test("status line names the client and model without a routing reason", () => {
     }
   }
   assert.equal(formatTime(new Date(2026, 0, 2, 3, 4, 5), "zh-CN"), "03:04:05");
+});
+
+test("window totals replace the page counts while the list stays the latest page", () => {
+  const now = new Date(2026, 5, 1, 12, 0, 0);
+  const requests = [0, 1, 2].map((index) => request({
+    id: `r${index}`,
+    createdAt: new Date(now.getTime() - index * 1000).toISOString(),
+    status: index === 0 ? "failed" : "completed",
+  }));
+  const view = stage(requests, {
+    now,
+    window: "today",
+    limit: 50,
+    totals: { requests: 80, inFlight: 4, failed: 7 },
+  });
+  assert.equal(view.shown, 3);
+  assert.equal(view.log.length, 3);
+  assert.equal(view.counts.requests, 80);
+  assert.equal(view.counts.inFlight, 4);
+  assert.equal(view.counts.failed, 7);
+  assert.deepEqual(view.note, { kind: "list", count: 3 });
+});
+
+test("a complete window uses the totals and does not add a sample note", () => {
+  const now = new Date(2026, 5, 1, 12, 0, 0);
+  const view = stage([
+    request({ id: "a", createdAt: now.toISOString(), status: "failed" }),
+    request({ id: "b", createdAt: now.toISOString(), status: "processing" }),
+  ], {
+    now,
+    window: "live",
+    limit: 50,
+    totals: { requests: 2, inFlight: 1, failed: 1 },
+  });
+  assert.equal(view.counts.requests, 2);
+  assert.equal(view.counts.inFlight, 1);
+  assert.equal(view.counts.failed, 1);
+  assert.equal(view.note, null);
+});
+
+test("a client filter counts the fetched page when the window is larger", () => {
+  const now = new Date(2026, 5, 1, 12, 0, 0);
+  const view = stage([
+    request({ id: "cursor", userAgent: "cursor/1", createdAt: now.toISOString(), status: "failed" }),
+    request({ id: "claude", userAgent: "claude-cli/1", createdAt: now.toISOString(), status: "processing" }),
+  ], {
+    now,
+    window: "today",
+    limit: 2,
+    clientFilter: "cursor",
+    totals: { requests: 40, inFlight: 3, failed: 9 },
+  });
+  assert.equal(view.shown, 1);
+  assert.equal(view.counts.requests, 1);
+  assert.equal(view.counts.inFlight, 0);
+  assert.equal(view.counts.failed, 1);
+  assert.deepEqual(view.note, { kind: "sample", count: 2 });
+});
+
+test("a client filter over a complete window is that client's real count", () => {
+  const now = new Date(2026, 5, 1, 12, 0, 0);
+  const view = stage([
+    request({ id: "cursor", userAgent: "cursor/1", createdAt: now.toISOString() }),
+    request({ id: "claude", userAgent: "claude-cli/1", createdAt: now.toISOString() }),
+  ], {
+    now,
+    window: "today",
+    limit: 50,
+    clientFilter: "cursor",
+    totals: { requests: 2, inFlight: 0, failed: 0 },
+  });
+  assert.equal(view.counts.requests, 1);
+  assert.equal(view.note, null);
+});
+
+test("without totals a full page is labeled as the latest rows", () => {
+  const now = new Date(2026, 5, 1, 12, 0, 0);
+  const requests = [0, 1].map((index) => request({
+    id: `r${index}`,
+    createdAt: new Date(now.getTime() - index * 1000).toISOString(),
+  }));
+  const view = stage(requests, { now, window: "live", limit: 2 });
+  assert.equal(view.counts.requests, 2);
+  assert.deepEqual(view.note, { kind: "sample", count: 2 });
 });
 
 test("format and page sources stay inside the plugin boundary", () => {

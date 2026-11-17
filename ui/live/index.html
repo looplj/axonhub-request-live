@@ -19,11 +19,18 @@
             <select id="client-filter"></select>
           </label>
           <div id="window-toggle" class="segmented" role="group"></div>
+          <label class="filter limit">
+            <span id="limit-label" class="sr-only">Rows</span>
+            <select id="limit"></select>
+          </label>
         </div>
       </header>
       <p id="hint" class="hint" role="status" hidden></p>
       <p id="status" class="status" role="status" hidden></p>
-      <section id="counts" class="stats" hidden></section>
+      <div id="stats-block" class="stats-block" hidden>
+        <p id="sample-note" class="sample-note" hidden></p>
+        <section id="counts" class="stats"></section>
+      </div>
       <section id="focus-bar" class="focus-bar" hidden>
         <span id="focus-tag" class="focus-tag"></span>
         <p id="summary" class="summary"></p>

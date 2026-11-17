@@ -339,7 +339,7 @@ function pickFocus(entries, focusId, pinned) {
   return sorted.length ? sorted[0].id : null;
 }
 
-export function buildStage({ requests, now, window: mode, focusId, pinned, clientFilter }) {
+export function buildStage({ requests, now, window: mode, focusId, pinned, clientFilter, limit, totals }) {
   const nowDate = now instanceof Date ? now : new Date(now);
   const range = mode === "today" ? "today" : "live";
   const filter = clientFilter && clientFilter !== "all" ? clientFilter : "all";
@@ -403,6 +403,7 @@ export function buildStage({ requests, now, window: mode, focusId, pinned, clien
     rowId: latestRow ? latestRow.rowId : "",
     elapsedMs: elapsedMs(focusEntry, nowDate),
   } : null;
+  const summary = countsFor(windowed, filtered, totals, filter, limit);
   const log = [...filtered].sort((left, right) => right.time - left.time || String(right.id).localeCompare(String(left.id)))
     .map((entry) => {
       const rows = rowsOf(entry);
@@ -424,16 +425,42 @@ export function buildStage({ requests, now, window: mode, focusId, pinned, clien
     clients: clients.map((client) => ({ ...client, nodeId: `client:${client.id}` })),
     keys,
     channels,
-    counts: {
-      requests: filtered.length,
-      inFlight: filtered.filter((entry) => inFlightStatus(entry.status)).length,
-      failed: filtered.filter((entry) => entry.status === "failed").length,
-    },
+    counts: summary.counts,
+    note: summary.note,
+    shown: filtered.length,
     log,
     wires: { focus: focusWires, faint },
     availableClients,
     windowCount: windowed.length,
   };
+}
+
+function countsFor(windowed, filtered, totals, filter, limit) {
+  const page = windowed.length;
+  const sample = {
+    requests: filtered.length,
+    inFlight: filtered.filter((entry) => inFlightStatus(entry.status)).length,
+    failed: filtered.filter((entry) => entry.status === "failed").length,
+  };
+  const knownTotal = isTotal(totals);
+  const truncated = knownTotal
+    ? totals.requests > page
+    : Number.isFinite(limit) && limit > 0 && page >= limit;
+  const aggregated = knownTotal && filter === "all";
+  return {
+    counts: aggregated
+      ? { requests: totals.requests, inFlight: totals.inFlight, failed: totals.failed }
+      : sample,
+    note: truncated && page > 0 ? { kind: aggregated ? "list" : "sample", count: page } : null,
+  };
+}
+
+function isTotal(totals) {
+  return Boolean(totals) && isCount(totals.requests) && isCount(totals.inFlight) && isCount(totals.failed);
+}
+
+function isCount(value) {
+  return Number.isInteger(value) && value >= 0;
 }
 
 function clientsFrom(entries) {
