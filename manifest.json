@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "local.request-live",
   "name": "实时请求",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "实时查看客户端、API 密钥，以及这些请求实际打到的渠道。",
   "axonhubVersion": "^1.0.0",
   "pluginApiVersion": 1,
