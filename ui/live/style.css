@@ -119,6 +119,8 @@ h2 {
 }
 
 .limit select { min-width: 96px; }
+.window select { min-width: 124px; }
+.refresh select { min-width: 76px; }
 
 select {
   appearance: none;
@@ -283,12 +285,40 @@ select:focus-visible, .segmented button:focus-visible, tbody tr:focus-visible {
 }
 
 .summary {
+  flex: 1;
   margin: 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
+}
+
+.clear-selection {
+  flex: none;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in oklab, var(--client, var(--primary, #1c1f24)) 35%, var(--border, #e3e6eb));
+  border-radius: calc(var(--radius, 0.75rem) - 5px);
+  background: var(--card, #ffffff);
+  color: var(--card-foreground, inherit);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color .15s, background-color .15s;
+}
+
+.clear-selection:hover {
+  background: color-mix(in oklab, var(--client, var(--primary, #1c1f24)) 8%, var(--card, #ffffff));
+}
+
+.clear-selection:focus-visible {
+  outline: 2px solid var(--ring, var(--primary, #1c1f24));
+  outline-offset: 1px;
+}
+
+.overview-note {
+  margin: 0;
+  padding: 0 2px;
 }
 
 /* stage */
@@ -306,30 +336,99 @@ select:focus-visible, .segmented button:focus-visible, tbody tr:focus-visible {
   align-items: stretch;
 }
 
-.wires, .dots {
+.wires {
   position: absolute;
   inset: 0;
+  z-index: 0;
   width: 100%;
   height: 100%;
   overflow: visible;
   pointer-events: none;
 }
 
-.wires { z-index: 0; }
-.dots { z-index: 2; }
-
 .wires path {
   fill: none;
   stroke-width: 1.5;
   stroke-linecap: round;
-  transition: opacity .3s;
+  transition: opacity .3s, stroke-width .3s;
 }
 
 .wire-faint { stroke: var(--faint); }
 
-.wire-focus { stroke-width: 2; }
+/* one path per visible request */
 
-.wire-live { stroke-dasharray: 3 5; }
+.track {
+  stroke-width: 1.7;
+  opacity: .92;
+  vector-effect: non-scaling-stroke;
+}
+
+.track.live {
+  stroke-dasharray: 5 6;
+  animation: track-flow .8s linear infinite;
+}
+
+.track.static {
+  stroke-dasharray: 2 5;
+  opacity: .5;
+}
+
+.track.stale {
+  stroke: var(--muted-foreground, #5e6772);
+  stroke-dasharray: 2 5;
+  opacity: .6;
+}
+
+.track.failed { stroke-width: 2; }
+
+.track.linger {
+  animation: track-fade 3s ease-out forwards;
+}
+
+.track.selected {
+  stroke-width: 3.2;
+  opacity: 1;
+}
+
+.track.linger.selected {
+  animation: none;
+  opacity: 1;
+}
+
+.track.linger.dim {
+  animation: none;
+  opacity: .15;
+}
+
+.track.dim { opacity: .15; }
+
+/* Higher specificity than `.wires path`, otherwise the faint 1.5px stroke
+   wins and the click target shrinks to the visual line. */
+.wires .track-hit {
+  stroke: transparent;
+  stroke-width: 14;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.wires .track-hit:focus-visible {
+  stroke: color-mix(in oklab, var(--primary, #1c1f24) 28%, transparent);
+  outline: none;
+}
+
+.track-end {
+  pointer-events: none;
+  opacity: .9;
+  transition: opacity .3s;
+}
+
+.track-end.selected {
+  stroke: var(--card, #ffffff);
+  stroke-width: 2;
+  opacity: 1;
+}
+
+.track-end.dim { opacity: .15; }
 
 .col {
   position: relative;
@@ -365,6 +464,16 @@ select:focus-visible, .segmented button:focus-visible, tbody tr:focus-visible {
   background: var(--muted, #eef1f4);
   font-size: 10.5px;
   font-weight: 560;
+  font-variant-numeric: tabular-nums;
+}
+
+.col-more {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--warn) 16%, transparent);
+  color: var(--warn);
+  font-size: 10.5px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
@@ -500,6 +609,49 @@ select:focus-visible, .segmented button:focus-visible, tbody tr:focus-visible {
   font-size: 11.5px;
 }
 
+.track-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 3px;
+}
+
+.track-chip {
+  display: inline-grid;
+  place-items: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--track, var(--muted, #eef1f4));
+  color: #fff;
+  font-size: 10px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  cursor: pointer;
+  opacity: .82;
+  transition: opacity .15s, transform .15s, box-shadow .15s;
+}
+
+.track-chip:hover { opacity: 1; }
+
+.track-chip.live { animation: chip-live 1.8s infinite; }
+
+.track-chip.failed { background: var(--destructive, #b42318); }
+
+.track-chip.selected {
+  opacity: 1;
+  border-color: var(--foreground, #1c1f24);
+  box-shadow: 0 0 0 2px var(--card, #ffffff), 0 0 0 3px var(--track, var(--primary, #1c1f24));
+}
+
+.track-chip:focus-visible {
+  outline: 2px solid var(--ring, var(--primary, #1c1f24));
+  outline-offset: 2px;
+}
+
 .channel.answering {
   border-color: color-mix(in oklab, var(--client) 60%, var(--border, #e3e6eb));
   box-shadow: 0 0 0 3px color-mix(in oklab, var(--client) 14%, transparent);
@@ -559,6 +711,13 @@ select:focus-visible, .segmented button:focus-visible, tbody tr:focus-visible {
 
 .badge.canceled { background: var(--muted, #eef1f4); }
 
+.badge.stale {
+  background: var(--muted, #eef1f4);
+  color: var(--muted-foreground, #5e6772);
+}
+
+.badge.stale::before { background: var(--muted-foreground, #5e6772); }
+
 /* log */
 
 .log-panel { overflow: hidden; }
@@ -605,7 +764,7 @@ td.muted { color: var(--muted-foreground, #5e6772); }
 tbody tr { cursor: pointer; transition: background-color .15s; }
 tbody tr:hover { background: color-mix(in oklab, var(--muted, #eef1f4) 60%, transparent); }
 
-tr.pinned, tr.pinned:hover {
+tr.selected, tr.selected:hover {
   background: color-mix(in oklab, var(--client, var(--primary, #1c1f24)) 8%, transparent);
   box-shadow: inset 3px 0 0 var(--client, var(--primary, #1c1f24));
 }
@@ -643,6 +802,18 @@ tr.fresh { animation: rise .4s ease-out; }
 
 @keyframes held { 50% { opacity: .45; } }
 
+@keyframes track-flow { to { stroke-dashoffset: -11; } }
+
+@keyframes track-fade {
+  0%, 72% { opacity: .92; }
+  100% { opacity: 0; }
+}
+
+@keyframes chip-live {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--track, currentColor) 45%, transparent); }
+  70%, 100% { box-shadow: 0 0 0 4px transparent; }
+}
+
 @keyframes live {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse, currentColor) 45%, transparent); }
   70%, 100% { box-shadow: 0 0 0 6px transparent; }
@@ -668,8 +839,11 @@ tr.fresh { animation: rise .4s ease-out; }
 
 @media (prefers-reduced-motion: reduce) {
   .arrive, .dot-hold, .wire-live, .tick.busy, .stat.busy .tick, .hub.busy, .badge::before,
-  .channel.flash-failed, .focus-bar.in, tr.fresh { animation: none; }
+  .channel.flash-failed, .focus-bar.in, tr.fresh, .track.live, .track.linger, .track-chip.live { animation: none; }
   .wire-live { stroke-dasharray: none; }
+  .track.live { stroke-dasharray: none; }
+  .track.linger { opacity: .6; }
+  .track.linger.selected { opacity: 1; }
 }
 
 @media (max-width: 900px) {

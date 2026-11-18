@@ -1,4 +1,16 @@
+import { TRACK_CAP } from "./query.js";
+
 export const SPARE_HUES = ["#8b5cf6", "#22c55e", "#0d9488", "#0891b2", "#ca8a04", "#db2777", "#2563eb", "#65a30d"];
+
+// Lane colors are keyed by request id, never by position, so a request keeps
+// its color across polls. Red is reserved for failed/canceled requests.
+export const REQUEST_HUES = [
+  ...SPARE_HUES,
+  "#7c3aed", "#0f766e", "#0369a1", "#a16207", "#be185d", "#1d4ed8", "#4d7c0f", "#0e7490",
+  "#9333ea", "#15803d",
+];
+
+export const LINGER_MS = 3000;
 
 export const CLIENTS = [
   { id: "claude", name: "Claude Code", hue: "#d97757", aliases: ["claude-cli", "claude-code"] },
@@ -22,23 +34,60 @@ export const CLIENTS = [
 ];
 
 const LIVE_MS = 15 * 60 * 1000;
-const CLIENT_CAP = 4;
-const KEY_CAP = 4;
-const CHANNEL_CAP = 8;
+const CLIENT_CAP = 6;
+const KEY_CAP = 8;
+const CHANNEL_CAP = 12;
+const STATIC_LINGER_LIMIT = 3;
 
 const byId = new Map(CLIENTS.map((client) => [client.id, client]));
+
+function hashOf(value) {
+  let hash = 0;
+  const text = String(value);
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+export function requestHue(id) {
+  return REQUEST_HUES[hashOf(id) % REQUEST_HUES.length];
+}
+
+// Lanes sharing the same client/key/channel are vertically offset so their
+// paths never collapse into one line.
+export function laneOffsetFor(position, total) {
+  if (!Number.isFinite(position) || !Number.isFinite(total) || total <= 1) return 0;
+  const spacing = Math.min(9, 56 / (total + 1));
+  return (position - (total - 1) / 2) * spacing;
+}
+
+export function toggleSelection(selectedId, id) {
+  if (!id) return "";
+  return selectedId === id ? "" : id;
+}
+
+export function isLiveStatus(status) {
+  return status === "pending" || status === "processing";
+}
+
+// Execution lookups follow exactly the live lanes of the current client filter,
+// then add the selected request for its detail pane.
+export function visibleExecutionIds(tracks, selectedId) {
+  const ids = [];
+  for (const track of Array.isArray(tracks) ? tracks : []) {
+    if (track && (track.live || track.lingering) && track.id && !ids.includes(track.id)) ids.push(track.id);
+  }
+  if (selectedId && !ids.includes(selectedId)) ids.push(selectedId);
+  return ids;
+}
 
 function present(client) {
   return { id: client.id, name: client.name, hue: client.hue };
 }
 
 export function spareHue(id) {
-  let hash = 0;
-  const text = String(id);
-  for (let index = 0; index < text.length; index += 1) {
-    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
-  }
-  return SPARE_HUES[hash % SPARE_HUES.length];
+  return SPARE_HUES[hashOf(id) % SPARE_HUES.length];
 }
 
 function productOf(userAgent) {
@@ -113,6 +162,7 @@ export function channelStatusText(kind, locale, extra) {
   if (kind === "answering") return zh ? "回答中…" : "Answering…";
   if (kind === "other") return zh ? "在回答另一个请求…" : "Answering another request…";
   if (kind === "pending") return zh ? "等待中" : "Waiting";
+  if (kind === "stale") return zh ? "状态未知" : "Unknown";
   if (kind === "completed") {
     const latency = formatLatency(info.latencyMs ?? info.latency);
     return zh ? `已完成 · ${latency}` : `Completed · ${latency}`;
@@ -183,7 +233,7 @@ function inFlightStatus(status) {
   return status === "pending" || status === "processing";
 }
 
-function inWindow(entry, mode, now) {
+function inWindow(entry, mode, now, windowMs) {
   if (inFlightStatus(entry.status)) return true;
   if (!Number.isFinite(entry.time)) return false;
   if (mode === "today") {
@@ -193,7 +243,8 @@ function inWindow(entry, mode, now) {
     end.setDate(end.getDate() + 1);
     return entry.time >= start.getTime() && entry.time < end.getTime();
   }
-  return entry.time >= now.getTime() - LIVE_MS;
+  const span = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : LIVE_MS;
+  return entry.time >= now.getTime() - span;
 }
 
 function keyIdOf(entry) {
@@ -296,22 +347,37 @@ function normalize(request) {
       name: request.channel.name || "",
     } : null,
     executions: request && request.executions,
+    executionTotalCount: request && Number.isInteger(request.executionTotalCount) ? request.executionTotalCount : null,
     client: identifyClient(request && request.userAgent, request && request.source),
   };
 }
 
-function capItems(items, limit, keepId) {
-  const sorted = [...items].sort((left, right) => right.latestAt - left.latestAt || String(left.id).localeCompare(String(right.id)));
-  if (sorted.length <= limit) return sorted;
-  if (!keepId || sorted.slice(0, limit).some((item) => item.id === keepId)) return sorted.slice(0, limit);
-  const kept = sorted.find((item) => item.id === keepId);
-  if (!kept) return sorted.slice(0, limit);
-  const others = sorted.filter((item) => item.id !== keepId).slice(0, limit - 1);
-  return [...others, kept].sort((left, right) => right.latestAt - left.latestAt || String(left.id).localeCompare(String(right.id)));
+function newestFirst(left, right) {
+  return right.time - left.time || String(right.id).localeCompare(String(left.id));
 }
 
-function kindFor(status, requestId, focusId) {
-  if (status === "processing") return requestId === focusId ? "answering" : "other";
+function oldestFirst(left, right) {
+  return left.time - right.time || String(left.id).localeCompare(String(right.id));
+}
+
+// Node caps keep whole lists readable. Tracks and the selected request are
+// always kept, even when that means a column grows past its soft cap.
+function capped(items, limit, keepIds) {
+  const keyOf = (item) => item.id || item.rowId || "";
+  const timeOf = (item) => (Number.isFinite(item.latestAt) ? item.latestAt : (Number.isFinite(item.activeAt) ? item.activeAt : 0));
+  const compare = (left, right) => timeOf(right) - timeOf(left) || String(keyOf(left)).localeCompare(String(keyOf(right)));
+  const sorted = [...items].sort(compare);
+  const keep = new Set((keepIds || []).filter(Boolean));
+  const kept = sorted.filter((item) => keep.has(keyOf(item)));
+  const room = Math.max(0, limit - kept.length);
+  const rest = sorted.filter((item) => !keep.has(keyOf(item))).slice(0, room);
+  const shown = [...kept, ...rest].sort(compare);
+  return { shown, overflow: Math.max(0, sorted.length - shown.length) };
+}
+
+function kindFor(status, requestId, selectedId) {
+  if (status === "stale") return "stale";
+  if (status === "processing") return selectedId && requestId !== selectedId ? "other" : "answering";
   if (status === "pending") return "pending";
   if (status === "failed" || status === "canceled") return "failed";
   if (status === "completed") return "completed";
@@ -330,51 +396,189 @@ function elapsedMs(entry, now) {
   return Math.max(0, now.getTime() - entry.time);
 }
 
-function pickFocus(entries, focusId, pinned) {
-  if (pinned && focusId && entries.some((entry) => entry.id === focusId)) return focusId;
-  const live = entries.filter((entry) => inFlightStatus(entry.status))
-    .sort((left, right) => right.time - left.time || String(right.id).localeCompare(String(left.id)));
-  if (live.length) return live[0].id;
-  const sorted = [...entries].sort((left, right) => right.time - left.time || String(right.id).localeCompare(String(left.id)));
-  return sorted.length ? sorted[0].id : null;
+function attemptIndex(entry) {
+  if (Number.isInteger(entry.executionTotalCount) && entry.executionTotalCount > 0) return entry.executionTotalCount;
+  return listExecutions(entry).length || 1;
 }
 
-export function buildStage({ requests, now, window: mode, focusId, pinned, clientFilter, limit, totals }) {
+function trackOf(entry, now, extra) {
+  const rows = rowsOf(entry);
+  const latest = rows.length ? rows[rows.length - 1] : null;
+  const live = inFlightStatus(entry.status);
+  const failed = entry.status === "failed" || entry.status === "canceled";
+  const stale = entry.status === "stale";
+  const lingering = Number.isFinite(extra.doneAt);
+  return {
+    id: entry.id,
+    trackIndex: extra.index + 1,
+    hue: failed ? "#b42318" : requestHue(entry.id),
+    live,
+    failed,
+    stale,
+    static: !live && !lingering && !stale,
+    lingering,
+    doneAt: lingering ? extra.doneAt : null,
+    clientId: entry.client.id,
+    clientName: entry.client.name,
+    keyId: keyIdOf(entry),
+    modelID: entry.modelID,
+    stream: entry.stream,
+    status: entry.status,
+    executionIndex: attemptIndex(entry),
+    channelName: latest ? latest.name : "",
+    rowId: latest ? latest.rowId : "",
+    elapsedMs: elapsedMs(entry, now),
+    createdAt: entry.createdAt,
+  };
+}
+
+export function buildStage({ requests, now, window: mode, windowMs, selectedId, focusId, clientFilter, limit, totals, historyCount, lingering, stale, inFlightTotal, inFlightMore }) {
   const nowDate = now instanceof Date ? now : new Date(now);
   const range = mode === "today" ? "today" : "live";
   const filter = clientFilter && clientFilter !== "all" ? clientFilter : "all";
   const all = (Array.isArray(requests) ? requests : []).filter(Boolean).map(normalize);
-  const windowed = all.filter((entry) => inWindow(entry, range, nowDate));
+  const allById = new Map(all.map((entry) => [entry.id, entry]));
+  const windowed = all.filter((entry) => inWindow(entry, range, nowDate, windowMs));
   const availableClients = clientsFrom(windowed);
   const filtered = filter === "all" ? windowed : windowed.filter((entry) => entry.client.id === filter);
-  const selectedId = pickFocus(filtered, focusId, Boolean(pinned));
-  const focusEntry = filtered.find((entry) => entry.id === selectedId) || null;
-  const focusClientId = focusEntry ? focusEntry.client.id : null;
-  const focusKeyId = focusEntry ? keyIdOf(focusEntry) : null;
-  const clients = capItems(clientsFrom(filtered), CLIENT_CAP, focusClientId);
-  const visibleClientIds = new Set(clients.map((client) => client.id));
-  const staged = filtered.filter((entry) => visibleClientIds.has(entry.client.id));
-  const keys = capItems(keysFrom(staged), KEY_CAP, focusKeyId).map((key) => ({
-    ...key,
-    nodeId: `key:${key.id}`,
-  }));
-  const visibleKeyIds = new Set(keys.map((key) => key.id));
-  const focusRows = focusEntry ? rowsOf(focusEntry) : [];
-  const channels = capChannels(channelRows(staged, selectedId), focusRows.map((row) => row.rowId));
-  const visibleRowIds = new Set(channels.map((row) => row.rowId));
-  const focusWires = [];
-  if (focusEntry) {
-    const clientNode = `client:${focusEntry.client.id}`;
-    const keyNode = `key:${keyIdOf(focusEntry)}`;
-    focusWires.push({ from: clientNode, to: keyNode });
-    focusWires.push({ from: keyNode, to: "hub" });
-    const seen = new Set();
-    for (const row of focusRows) {
-      if (seen.has(row.rowId) || !visibleRowIds.has(row.rowId)) continue;
-      seen.add(row.rowId);
-      focusWires.push({ from: "hub", to: `channel:${row.rowId}` });
+
+  const lingeringAt = new Map();
+  for (const item of Array.isArray(lingering) ? lingering : []) {
+    if (!item || !item.id) continue;
+    const at = toTime(item.doneAt);
+    if (!Number.isFinite(at) || nowDate.getTime() - at >= LINGER_MS) continue;
+    // A terminal-state lookup can carry a request that is already outside the
+    // history window. It stays as a lane for the linger interval.
+    const entry = allById.get(item.id) || (item.request ? normalize(item.request) : null);
+    if (!entry || inFlightStatus(entry.status)) continue;
+    if (filter !== "all" && entry.client.id !== filter) continue;
+    lingeringAt.set(item.id, { at, entry });
+  }
+
+  // Selection is explicit. Nothing is auto-selected; a new request cannot take
+  // the detail view away from the user.
+  const wanted = selectedId !== undefined ? selectedId : focusId;
+  const selectedFromList = wanted ? filtered.find((entry) => entry.id === wanted) : null;
+  const selectedBase = selectedFromList || (wanted && lingeringAt.get(wanted) ? lingeringAt.get(wanted).entry : null);
+  const liveSorted = filtered.filter((entry) => inFlightStatus(entry.status)).sort(newestFirst);
+  const liveVisible = liveSorted.slice(0, TRACK_CAP);
+  if (selectedBase && inFlightStatus(selectedBase.status) && !liveVisible.some((entry) => entry.id === selectedBase.id)) {
+    // A selected request that would fall into +N is pulled back into the
+    // visible lanes instead of silently disappearing.
+    if (liveVisible.length < TRACK_CAP) liveVisible.push(selectedBase);
+    else liveVisible[liveVisible.length - 1] = selectedBase;
+  }
+
+  const lingeringEntries = [];
+  for (const [id, item] of lingeringAt) {
+    if (liveVisible.some((entry) => entry.id === id)) continue;
+    lingeringEntries.push({ entry: item.entry, doneAt: item.at });
+  }
+  lingeringEntries.sort((left, right) => right.doneAt - left.doneAt);
+  lingeringEntries.length = Math.min(lingeringEntries.length, STATIC_LINGER_LIMIT);
+
+  // Stale requests are not in the list or window; they stay visible without
+  // active animation until a retry resolves them or the TTL expires.
+  const staleEntries = [];
+  for (const item of Array.isArray(stale) ? stale : []) {
+    const entry = item ? normalize(item) : null;
+    if (!entry || entry.status !== "stale") continue;
+    if (filter !== "all" && entry.client.id !== filter) continue;
+    if (filtered.some((known) => known.id === entry.id)) continue;
+    if (lingeringAt.has(entry.id)) continue;
+    staleEntries.push(entry);
+  }
+  const selectedStale = wanted ? staleEntries.find((entry) => entry.id === wanted) : null;
+  const selectedEntry = selectedBase || selectedStale;
+  const activeSelection = selectedEntry ? selectedEntry.id : "";
+
+  let entries = [];
+  if (!liveVisible.length) {
+    if (lingeringEntries.length) {
+      entries = lingeringEntries.map((item) => ({ entry: item.entry, doneAt: item.doneAt }));
+      if (selectedEntry && !entries.some((item) => item.entry.id === selectedEntry.id)) {
+        entries.push({ entry: selectedEntry });
+      }
+    } else {
+      // No in-flight work: keep an overview of the most recent history rather
+      // than falling back to one permanent focus row.
+      const recent = [...filtered].sort(newestFirst).slice(0, TRACK_CAP);
+      if (selectedFromList && !recent.some((entry) => entry.id === selectedFromList.id)) {
+        if (recent.length < TRACK_CAP) recent.push(selectedFromList);
+        else recent[recent.length - 1] = selectedFromList;
+      }
+      entries = recent.map((entry) => ({ entry }));
+    }
+  } else {
+    entries = [
+      ...liveVisible.map((entry) => ({ entry })),
+      ...lingeringEntries.map((item) => ({ entry: item.entry, doneAt: item.doneAt })),
+    ];
+    if (selectedEntry && !entries.some((item) => item.entry.id === selectedEntry.id)) {
+      entries.push({ entry: selectedEntry });
     }
   }
+  for (const entry of staleEntries) {
+    if (!entries.some((item) => item.entry.id === entry.id)) entries.push({ entry });
+  }
+  entries.sort((left, right) => oldestFirst(left.entry, right.entry));
+  const tracks = entries.map((item, index) => trackOf(item.entry, nowDate, {
+    index,
+    doneAt: item.doneAt,
+  }));
+  const selectedTrack = tracks.find((track) => track.id === activeSelection) || null;
+
+  // Lingering terminal requests must still have nodes to draw their lane.
+  const stageEntries = [...filtered];
+  const stageIds = new Set(filtered.map((entry) => entry.id));
+  for (const item of lingeringEntries) {
+    if (stageIds.has(item.entry.id)) continue;
+    stageIds.add(item.entry.id);
+    stageEntries.push(item.entry);
+  }
+  for (const entry of staleEntries) {
+    if (stageIds.has(entry.id)) continue;
+    stageIds.add(entry.id);
+    stageEntries.push(entry);
+  }
+  if (selectedEntry && !stageIds.has(selectedEntry.id)) {
+    stageIds.add(selectedEntry.id);
+    stageEntries.push(selectedEntry);
+  }
+
+  const trackClientIds = tracks.map((track) => track.clientId);
+  const trackKeyIds = tracks.map((track) => track.keyId);
+  const trackRowIds = tracks.map((track) => track.rowId).filter(Boolean);
+  const clientCap = capped(
+    clientsFrom(stageEntries),
+    CLIENT_CAP,
+    [selectedEntry ? selectedEntry.client.id : "", ...trackClientIds],
+  );
+  const clients = clientCap.shown;
+  const visibleClientIds = new Set(clients.map((client) => client.id));
+  const staged = stageEntries.filter((entry) => visibleClientIds.has(entry.client.id));
+  const keyCap = capped(
+    keysFrom(staged),
+    KEY_CAP,
+    [selectedEntry ? keyIdOf(selectedEntry) : "", ...trackKeyIds],
+  );
+  const keys = keyCap.shown.map((key) => ({ ...key, nodeId: `key:${key.id}` }));
+  const visibleKeyIds = new Set(keys.map((key) => key.id));
+  const channelCap = capChannels(
+    channelRows(staged, activeSelection),
+    [selectedEntry ? rowsOf(selectedEntry).map((row) => row.rowId) : [], ...trackRowIds].flat(),
+  );
+  const channels = channelCap.shown.map((row) => ({
+    ...row,
+    tracks: tracks.filter((track) => track.rowId === row.rowId).map((track) => ({
+      id: track.id,
+      index: track.trackIndex,
+      hue: track.hue,
+      live: track.live,
+      failed: track.failed,
+    })),
+  }));
+
   const faint = [];
   const pairs = new Set();
   for (const entry of staged) {
@@ -388,55 +592,68 @@ export function buildStage({ requests, now, window: mode, focusId, pinned, clien
   for (const row of channels) {
     faint.push({ from: "hub", to: row.nodeId, kind: "hub-channel" });
   }
-  const latestRow = focusRows.length ? focusRows[focusRows.length - 1] : null;
-  const focus = focusEntry ? {
-    id: focusEntry.id,
-    clientId: focusEntry.client.id,
-    clientName: focusEntry.client.name,
-    hue: focusEntry.client.hue,
-    keyId: keyIdOf(focusEntry),
-    modelID: focusEntry.modelID,
-    stream: focusEntry.stream,
-    status: focusEntry.status,
-    executionIndex: listExecutions(focusEntry).length || 1,
-    channelName: latestRow ? latestRow.name : "",
-    rowId: latestRow ? latestRow.rowId : "",
-    elapsedMs: elapsedMs(focusEntry, nowDate),
+
+  const focus = selectedTrack ? {
+    ...selectedTrack,
+    trackTotal: tracks.length,
   } : null;
-  const summary = countsFor(windowed, filtered, totals, filter, limit);
-  const log = [...filtered].sort((left, right) => right.time - left.time || String(right.id).localeCompare(String(left.id)))
-    .map((entry) => {
-      const rows = rowsOf(entry);
-      const latest = rows.length ? rows[rows.length - 1] : null;
-      return {
-        id: entry.id,
-        createdAt: entry.createdAt,
-        client: entry.client,
-        apiKeyName: entry.apiKey ? entry.apiKey.name : "",
-        modelID: entry.modelID,
-        status: entry.status,
-        channelName: latest ? latest.name : "",
-        latencyMs: numberOrNull(entry.metricsLatencyMs),
-      };
-    });
+  const summary = countsFor(windowed, filtered, totals, filter, limit, historyCount);
+  const log = [...filtered].sort(newestFirst).map((entry) => {
+    const rows = rowsOf(entry);
+    const latest = rows.length ? rows[rows.length - 1] : null;
+    const failed = entry.status === "failed" || entry.status === "canceled";
+    return {
+      id: entry.id,
+      createdAt: entry.createdAt,
+      client: entry.client,
+      hue: failed ? "#b42318" : requestHue(entry.id),
+      apiKeyName: entry.apiKey ? entry.apiKey.name : "",
+      modelID: entry.modelID,
+      status: entry.status,
+      channelName: latest ? latest.name : "",
+      latencyMs: numberOrNull(entry.metricsLatencyMs),
+    };
+  });
+  const loadedLive = liveSorted.length;
+  const knownLiveTotal = Number.isInteger(inFlightTotal) && inFlightTotal >= loadedLive ? inFlightTotal : null;
+  const trackTotal = knownLiveTotal == null ? loadedLive : knownLiveTotal;
+  const staleCount = tracks.filter((track) => track.stale).length;
   return {
-    focusId: selectedId,
+    focusId: activeSelection,
     focus,
+    tracks,
+    trackTotal,
+    trackOverflow: Math.max(0, trackTotal - liveVisible.length),
+    inFlightLoaded: loadedLive,
+    inFlightTotal: knownLiveTotal,
+    inFlightMore: knownLiveTotal == null && Boolean(inFlightMore),
+    inFlightTruncated: knownLiveTotal != null && knownLiveTotal > loadedLive,
+    staleCount,
+    staticOverview: !liveVisible.length
+      && !tracks.some((track) => track.lingering)
+      && !staleCount
+      && tracks.length > 0,
     clients: clients.map((client) => ({ ...client, nodeId: `client:${client.id}` })),
     keys,
     channels,
+    nodeOverflow: { clients: clientCap.overflow, keys: keyCap.overflow, channels: channelCap.overflow },
     counts: summary.counts,
     note: summary.note,
+    scope: summary.scope,
+    windowTotal: summary.windowTotal,
+    pageCount: summary.pageCount,
     shown: filtered.length,
     log,
-    wires: { focus: focusWires, faint },
+    wires: { faint },
     availableClients,
     windowCount: windowed.length,
   };
 }
 
-function countsFor(windowed, filtered, totals, filter, limit) {
+function countsFor(windowed, filtered, totals, filter, limit, historyCount) {
   const page = windowed.length;
+  const historyPage = Number.isInteger(historyCount) && historyCount >= 0 ? historyCount : page;
+  const listPage = historyPage || page;
   const sample = {
     requests: filtered.length,
     inFlight: filtered.filter((entry) => inFlightStatus(entry.status)).length,
@@ -451,7 +668,10 @@ function countsFor(windowed, filtered, totals, filter, limit) {
     counts: aggregated
       ? { requests: totals.requests, inFlight: totals.inFlight, failed: totals.failed }
       : sample,
-    note: truncated && page > 0 ? { kind: aggregated ? "list" : "sample", count: page } : null,
+    note: truncated && listPage > 0 ? { kind: aggregated ? "list" : "sample", count: listPage } : null,
+    scope: aggregated ? "window" : (filter === "all" ? "list" : "sample"),
+    windowTotal: knownTotal ? totals.requests : null,
+    pageCount: listPage,
   };
 }
 
@@ -547,11 +767,6 @@ function channelRows(entries, focusId) {
   });
 }
 
-function capChannels(rows, focusRowIds) {
-  const sorted = [...rows].sort((left, right) => right.activeAt - left.activeAt || String(left.rowId).localeCompare(String(right.rowId)));
-  const focusSet = new Set(focusRowIds);
-  const focusRows = sorted.filter((row) => focusSet.has(row.rowId)).slice(0, CHANNEL_CAP);
-  const room = CHANNEL_CAP - focusRows.length;
-  const others = sorted.filter((row) => !focusSet.has(row.rowId)).slice(0, Math.max(0, room));
-  return [...focusRows, ...others].sort((left, right) => right.activeAt - left.activeAt || String(left.rowId).localeCompare(String(right.rowId)));
+function capChannels(rows, keepRowIds) {
+  return capped(rows, CHANNEL_CAP, keepRowIds);
 }

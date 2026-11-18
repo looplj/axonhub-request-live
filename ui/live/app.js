@@ -2,47 +2,100 @@ import {
   buildStage,
   channelStatusText,
   clientLabel,
-  currentRowId,
   formatLatency,
   formatTime,
   isChinese,
-  rowMotion,
+  isLiveStatus,
+  laneOffsetFor,
+  LINGER_MS,
   statusLine,
+  toggleSelection,
+  visibleExecutionIds,
 } from "./format.js";
 import { iconSvg } from "./icons.js";
+import {
+  DEFAULT_LIMIT,
+  DEFAULT_REFRESH,
+  DEFAULT_WINDOW,
+  INFLIGHT_BUDGET,
+  INFLIGHT_LIMIT,
+  LIMITS,
+  REFRESH_SECONDS,
+  TRACK_CAP,
+  WINDOW_OPTIONS,
+  attachExecutions,
+  backfillDecision,
+  channelRetryPlan,
+  channelSelectionForbidden,
+  clampLimit,
+  clampRefresh,
+  clampWindow,
+  connectionOf,
+  errorsOf,
+  executionsQuery,
+  hasForbidden,
+  historyQuery,
+  inflightQuery,
+  isForbiddenError,
+  mapRequest,
+  mergeRequests,
+  nextInflightCursor,
+  nodesOf,
+  pageInfoOf,
+  readStateNodes,
+  readTotals,
+  requestStateQuery,
+  retiredLiveIds,
+  settle,
+  sinceFor,
+  statsAccept,
+  statsDue,
+  statsQuery,
+  statsVisible,
+  statsWindowMatches,
+  statsTotalsForWindow,
+  transportErrors,
+  windowMsFor,
+} from "./query.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const KEY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="8.5" cy="9" r="3.25" stroke="currentColor" stroke-width="1.5"/><path d="M11.2 11.2 19 19M15.5 16.2h3.2V19" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const HUB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
-// Where a waiting dot rests: on the wire, just short of the node it waits at.
-const HOLD_GAP = 11;
-const LIVE_MS = 15 * 60 * 1000;
-const LIMITS = [25, 50, 100, 200];
-const DEFAULT_LIMIT = 50;
-const OUT_MS = 1100;
-const BACK_MS = 1100;
-const SWITCH_MS = 480;
 
 const COPY = {
   zh: {
     title: "实时请求",
     filter: "客户端",
     allClients: "全部客户端",
-    live: "近 15 分钟",
-    today: "今天",
+    window: "时间",
+    windows: {
+      "5m": "近 5 分钟",
+      "10m": "近 10 分钟",
+      "15m": "近 15 分钟",
+      "30m": "近 30 分钟",
+      "1h": "近 1 小时",
+      "2h": "近 2 小时",
+      today: "今天",
+    },
     loading: "正在读取…",
     updated: (time) => `更新于 ${time}`,
-    emptyLive: "这 15 分钟里还没有请求。",
-    emptyToday: "今天还没有请求。",
+    emptyWindow: (label) => (label === "今天" ? "今天还没有请求。" : `${label}里还没有请求。`),
     emptyFilter: "这个客户端在当前窗口里没有请求。",
-    requests: "请求",
-    inFlight: "进行中",
-    failed: "失败",
+    requests: "窗口共",
+    listLatest: "列表最新",
+    inFlightNow: "当前进行中",
+    failedWindow: "窗口失败",
     limit: "条数",
     limitOption: (count) => `${count} 条`,
-    sampleStats: (count) => `最新 ${count} 条中`,
-    listSample: (count) => `列表为最新 ${count} 条`,
-    emptyFilterSample: (count) => `最新 ${count} 条里没有这个客户端的请求。`,
+    refresh: "刷新",
+    refreshOption: (seconds) => `${seconds} 秒`,
+    statsWindow: (total, count) => `窗口共 ${total} 条 · 列表最新 ${count} 条`,
+    statsWindowComplete: (total) => `窗口共 ${total} 条`,
+    statsList: (count) => `列表最新 ${count} 条（窗口总数未取得）`,
+    statsSample: (count) => `客户端筛选后的样本统计（历史最新 ${count} 条 + 当前进行中）`,
+    statsHint: "窗口统计最多每 10 秒刷新一次；列表、进行中和筛选样本按所选刷新间隔更新。",
+    statsUnavailable: "窗口统计暂时不可用，下面是列表样本。",
+    emptyFilterSample: (count) => `历史最新 ${count} 条和进行中请求里没有这个客户端的请求。`,
     noKey: "无密钥",
     unassigned: "未关联",
     time: "时间",
@@ -61,16 +114,28 @@ const COPY = {
     statusCompleted: "已完成",
     statusFailed: "失败",
     statusCanceled: "已取消",
+    statusStale: "状态未知",
     keyEnabled: "启用",
     keyDisabled: "停用",
     keyArchived: "已归档",
     channelHint: "未授予 read_channels，渠道只显示 ID。",
     logTitle: "最近请求",
-    pinHint: "点击一行固定查看",
-    pinnedHint: "已固定，再次点击取消",
-    tagPinned: "已固定",
+    pinHint: "点击轨道或列表查看详情；Esc 回到实时",
+    pinnedHint: "已选中。再次点击、Esc 或「回到实时」取消",
+    tagPinned: "已选中",
+    trackTag: (index) => `已选中 · 轨道 ${index}`,
     tagLive: "进行中",
     tagLatest: "最新",
+    backToLive: "回到实时",
+    tracksLabel: "请求轨道",
+    staticOverview: "当前没有进行中的请求，显示最近请求的静态概览。",
+    inFlightLimited: (loaded, total) => `进行中请求已加载 ${loaded} / 共 ${total} 条（达到查询上限）。`,
+    inFlightMore: (loaded) => `已加载 ${loaded} 条进行中请求，仍有更多（精确总数尚未取得）。`,
+    trackOverflow: (count) => `还有 ${count} 条进行中请求没有显示为轨道；点选列表中的请求会自动把它拉回可见范围。`,
+    trackOverflowLower: (count) => `至少还有 ${count} 条进行中请求没有显示为轨道；点选列表中的请求会自动把它拉回可见范围。`,
+    moreNodes: (count) => `还有 ${count} 个未显示`,
+    trackLabel: (index) => `轨道 ${index}`,
+    noChannel: "无渠道",
     hubIdle: "空闲",
     hubBusy: (count) => `${count} 进行中`,
     requestFailed: (message) => (message ? `请求失败：${message}` : "请求失败。"),
@@ -81,21 +146,38 @@ const COPY = {
     title: "Live requests",
     filter: "Client",
     allClients: "All clients",
-    live: "Last 15 min",
-    today: "Today",
+    window: "Window",
+    windows: {
+      "5m": "Last 5 min",
+      "10m": "Last 10 min",
+      "15m": "Last 15 min",
+      "30m": "Last 30 min",
+      "1h": "Last 1 hour",
+      "2h": "Last 2 hours",
+      today: "Today",
+    },
     loading: "Loading…",
     updated: (time) => `Updated ${time}`,
-    emptyLive: "No requests in the last 15 minutes.",
-    emptyToday: "No requests yet today.",
+    emptyWindow: (label) => {
+      const value = label.toLowerCase();
+      return value === "today" ? "No requests yet today." : `No requests in the ${value}.`;
+    },
     emptyFilter: "No requests for this client in the current window.",
-    requests: "Requests",
-    inFlight: "In flight",
-    failed: "Failed",
+    requests: "In window",
+    listLatest: "List latest",
+    inFlightNow: "In flight now",
+    failedWindow: "Failed in window",
     limit: "Rows",
     limitOption: (count) => `${count} rows`,
-    sampleStats: (count) => `Latest ${count}`,
-    listSample: (count) => `List shows the latest ${count}`,
-    emptyFilterSample: (count) => `No requests for this client in the latest ${count}.`,
+    refresh: "Refresh",
+    refreshOption: (seconds) => `${seconds}s`,
+    statsWindow: (total, count) => `${total} in window · list shows the latest ${count}`,
+    statsWindowComplete: (total) => `${total} in window`,
+    statsList: (count) => `List shows the latest ${count} (window total unavailable)`,
+    statsSample: (count) => `Client-filtered sample (latest ${count} history rows + in-flight)`,
+    statsHint: "Window counts refresh at most every 10 seconds; the list, in-flight rows, and filtered sample follow the selected refresh interval.",
+    statsUnavailable: "Window counts are temporarily unavailable; the sample below comes from the list.",
+    emptyFilterSample: (count) => `No requests for this client in the latest ${count} history rows or in-flight work.`,
     noKey: "No API key",
     unassigned: "Unassigned",
     time: "Time",
@@ -114,16 +196,28 @@ const COPY = {
     statusCompleted: "Completed",
     statusFailed: "Failed",
     statusCanceled: "Canceled",
+    statusStale: "Unknown",
     keyEnabled: "Enabled",
     keyDisabled: "Disabled",
     keyArchived: "Archived",
     channelHint: "read_channels is not granted, so channel ids are shown.",
     logTitle: "Recent requests",
-    pinHint: "Click a row to pin it",
-    pinnedHint: "Pinned. Click it again to unpin",
-    tagPinned: "Pinned",
+    pinHint: "Click a track or a row to inspect it; press Esc to return to live",
+    pinnedHint: "Selected. Click again, press Esc, or choose Back to live to clear.",
+    tagPinned: "Selected",
+    trackTag: (index) => `Selected · track ${index}`,
     tagLive: "Live",
     tagLatest: "Latest",
+    backToLive: "Back to live",
+    tracksLabel: "Request tracks",
+    staticOverview: "No requests in flight. Showing a static overview of recent requests.",
+    inFlightLimited: (loaded, total) => `Loaded ${loaded} of ${total} in-flight requests (query budget reached).`,
+    inFlightMore: (loaded) => `Loaded ${loaded} in-flight requests; more remain and the exact total is not available yet.`,
+    trackOverflow: (count) => `${count} more in-flight requests are not shown as tracks; picking one in the list pulls it back into view.`,
+    trackOverflowLower: (count) => `At least ${count} more in-flight requests are not shown as tracks; picking one in the list pulls it back into view.`,
+    moreNodes: (count) => `${count} more not shown`,
+    trackLabel: (index) => `Track ${index}`,
+    noChannel: "No channel",
     hubIdle: "Idle",
     hubBusy: (count) => `${count} in flight`,
     requestFailed: (message) => (message ? `Request failed: ${message}` : "Request failed."),
@@ -132,27 +226,30 @@ const COPY = {
   },
 };
 
-const LIST_FIELDS = `id createdAt updatedAt status modelID stream source userAgent metricsLatencyMs metricsFirstTokenLatencyMs apiKey { id name status type }`;
-
 const titleEl = document.querySelector("#title");
 const filterLabel = document.querySelector("#filter-label");
 const filterEl = document.querySelector("#client-filter");
+const windowLabel = document.querySelector("#window-label");
+const windowEl = document.querySelector("#window");
 const limitLabel = document.querySelector("#limit-label");
 const limitEl = document.querySelector("#limit");
-const toggleEl = document.querySelector("#window-toggle");
+const refreshLabel = document.querySelector("#refresh-label");
+const refreshEl = document.querySelector("#refresh");
 const updatedEl = document.querySelector("#updated");
 const hintEl = document.querySelector("#hint");
 const statusEl = document.querySelector("#status");
 const stageScroll = document.querySelector("#stage-scroll");
 const stage = document.querySelector("#stage");
 const wires = document.querySelector("#wires");
-const dots = document.querySelector("#dots");
 const tickEl = document.querySelector("#tick");
 const summaryEl = document.querySelector("#summary");
 const focusBar = document.querySelector("#focus-bar");
 const focusTag = document.querySelector("#focus-tag");
+const clearButton = document.querySelector("#clear-selection");
+const overviewNote = document.querySelector("#overview-note");
 const statsBlock = document.querySelector("#stats-block");
 const sampleNoteEl = document.querySelector("#sample-note");
+const statsHintEl = document.querySelector("#stats-hint");
 const countsEl = document.querySelector("#counts");
 const logPanel = document.querySelector("#log-panel");
 const logTitle = document.querySelector("#log-title");
@@ -165,44 +262,41 @@ const colKeys = document.querySelector("#col-keys");
 const colHub = document.querySelector("#col-hub");
 const colChannels = document.querySelector("#col-channels");
 
-const liveButton = document.createElement("button");
-const todayButton = document.createElement("button");
-liveButton.type = "button";
-todayButton.type = "button";
-liveButton.dataset.mode = "live";
-todayButton.dataset.mode = "today";
-toggleEl.append(liveButton, todayButton);
-
 let locale = document.documentElement.lang || "en";
 let text = copy(locale);
-let mode = "live";
+let mode = DEFAULT_WINDOW;
 let limit = DEFAULT_LIMIT;
+let refreshSeconds = DEFAULT_REFRESH;
 let fetchedLimit = DEFAULT_LIMIT;
-let fetchedMode = "live";
 let clientFilter = "all";
-let pinned = false;
-let pinId = "";
+let selectedId = "";
 let namesDenied = false;
 let latestRequests = [];
+let latestHistoryCount = 0;
+let latestInFlightMore = false;
 let latestTotals = null;
+let statsAt = 0;
+let statsLoaded = false;
+let statsError = false;
+let statsMode = "";
+let statsToken = 0;
+let statsVersion = 0;
+let lastVisibleTrackIds = [];
+let prevRequests = new Map();
 let fetchedAt = null;
 let hasInFlight = false;
 let loadedOnce = false;
-let primed = false;
-let prevSnap = null;
 let timer = 0;
 let fetching = false;
 let queued = false;
 let generation = 0;
-let playToken = 0;
-let rafId = 0;
-let flying = false;
-let hold = null;
-let paintedFocus = "";
 let filterKey = "";
 let barFocus = "";
 let seenRows = null;
 const flashes = new Map();
+const lingering = new Map();
+const staleTracking = new Map();
+let lingerTimer = 0;
 let stopTheme = () => {};
 
 applyStaticCopy();
@@ -216,7 +310,7 @@ if (!bridge || typeof bridge.ready !== "function") {
   const onPageHide = () => {
     stopTheme();
     clearTimeout(timer);
-    cancelAnimationFrame(rafId);
+    clearTimeout(lingerTimer);
   };
   window.addEventListener("pagehide", onPageHide, { once: true });
   document.addEventListener("visibilitychange", () => {
@@ -228,7 +322,7 @@ if (!bridge || typeof bridge.ready !== "function") {
     poll();
   });
   window.addEventListener("resize", () => {
-    if (loadedOnce) render({ loaded: true });
+    if (loadedOnce) render();
   });
   start().catch(showError);
 }
@@ -244,13 +338,14 @@ function applyStaticCopy() {
   titleEl.textContent = text.title;
   logTitle.textContent = text.logTitle;
   filterLabel.textContent = text.filter;
-  liveButton.textContent = text.live;
-  todayButton.textContent = text.today;
-  toggleEl.setAttribute("aria-label", `${text.live} / ${text.today}`);
-  paintToggle();
+  clearButton.textContent = text.backToLive;
+  wires.setAttribute("aria-label", text.tracksLabel);
+  fillWindow();
   fillLimit();
+  fillRefresh();
   if (!fetchedAt) updatedEl.textContent = text.loading;
   if (!hintEl.hidden) hintEl.textContent = text.channelHint;
+  statsHintEl.textContent = text.statsHint;
 }
 
 function applyTheme(theme) {
@@ -270,7 +365,27 @@ async function start() {
 function wireControls() {
   filterEl.addEventListener("change", () => {
     clientFilter = filterEl.value || "all";
-    if (loadedOnce) render({ loaded: true });
+    lastVisibleTrackIds = [];
+    if (loadedOnce) render();
+    // Execution lookups follow the filtered lanes, so refresh them.
+    poll();
+  });
+  windowEl.addEventListener("change", () => {
+    const next = clampWindow(windowEl.value);
+    windowEl.value = next;
+    if (next === mode) return;
+    mode = next;
+    // Keep the global stats throttle: the new window waits for the remaining
+    // interval instead of issuing a fresh stats query immediately.
+    latestTotals = null;
+    statsMode = "";
+    statsLoaded = false;
+    statsError = false;
+    statsVersion += 1;
+    latestHistoryCount = 0;
+    lastVisibleTrackIds = [];
+    if (loadedOnce) render();
+    poll();
   });
   limitEl.addEventListener("change", () => {
     const next = clampLimit(limitEl.value);
@@ -279,26 +394,17 @@ function wireControls() {
     limit = next;
     poll();
   });
-  toggleEl.addEventListener("click", (event) => {
-    const button = event.target.closest("button");
-    if (!button || button.dataset.mode === mode) return;
-    mode = button.dataset.mode;
-    paintToggle();
-    if (loadedOnce) render({ loaded: true });
-    poll();
+  refreshEl.addEventListener("change", () => {
+    const next = clampRefresh(refreshEl.value);
+    refreshEl.value = String(next);
+    if (next === refreshSeconds) return;
+    refreshSeconds = next;
+    if (!fetching) poll();
   });
   logWrap.addEventListener("click", (event) => {
     const row = event.target.closest("tr[data-id]");
     if (!row) return;
-    const id = row.dataset.id;
-    if (pinned && pinId === id) {
-      pinned = false;
-      pinId = "";
-    } else {
-      pinned = true;
-      pinId = id;
-    }
-    render({ loaded: true });
+    selectTrack(row.dataset.id);
   });
   logWrap.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -307,11 +413,56 @@ function wireControls() {
     event.preventDefault();
     row.click();
   });
+  stage.addEventListener("click", (event) => {
+    const hit = event.target.closest("[data-track-id]");
+    if (!hit) return;
+    selectTrack(hit.dataset.trackId);
+  });
+  stage.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const hit = event.target.closest("[data-track-id]");
+    if (!hit) return;
+    event.preventDefault();
+    selectTrack(hit.dataset.trackId);
+  });
+  colChannels.addEventListener("click", (event) => {
+    const chip = event.target.closest("[data-track-id]");
+    if (!chip) return;
+    event.stopPropagation();
+    selectTrack(chip.dataset.trackId);
+  });
+  clearButton.addEventListener("click", () => {
+    if (!selectedId) return;
+    selectedId = "";
+    render();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !selectedId) return;
+    selectedId = "";
+    render();
+  });
 }
 
-function paintToggle() {
-  liveButton.setAttribute("aria-pressed", mode === "live" ? "true" : "false");
-  todayButton.setAttribute("aria-pressed", mode === "today" ? "true" : "false");
+function selectTrack(id) {
+  selectedId = toggleSelection(selectedId, id);
+  render();
+}
+
+function windowLabelFor(id) {
+  return (text.windows && text.windows[id]) || id;
+}
+
+function fillWindow() {
+  windowLabel.textContent = text.window;
+  windowEl.setAttribute("aria-label", text.window);
+  windowEl.replaceChildren();
+  for (const option of WINDOW_OPTIONS) {
+    const el = document.createElement("option");
+    el.value = option.id;
+    el.textContent = windowLabelFor(option.id);
+    windowEl.append(el);
+  }
+  windowEl.value = mode;
 }
 
 function fillLimit() {
@@ -327,9 +478,17 @@ function fillLimit() {
   limitEl.value = String(limit);
 }
 
-function clampLimit(value) {
-  const number = Number(value);
-  return LIMITS.includes(number) ? number : DEFAULT_LIMIT;
+function fillRefresh() {
+  refreshLabel.textContent = text.refresh;
+  refreshEl.setAttribute("aria-label", text.refresh);
+  refreshEl.replaceChildren();
+  for (const seconds of REFRESH_SECONDS) {
+    const option = document.createElement("option");
+    option.value = String(seconds);
+    option.textContent = text.refreshOption(seconds);
+    refreshEl.append(option);
+  }
+  refreshEl.value = String(refreshSeconds);
 }
 
 function poll() {
@@ -358,210 +517,315 @@ function schedule() {
   clearTimeout(timer);
   timer = 0;
   if (document.hidden) return;
-  timer = setTimeout(poll, hasInFlight ? 2000 : 5000);
+  timer = setTimeout(poll, refreshSeconds * 1000);
 }
 
 async function load(gen) {
+  const windowMode = mode;
   const now = new Date();
-  const since = sinceFor(mode, now).toISOString();
+  const since = sinceFor(windowMode, now).toISOString();
   const first = clampLimit(limit);
-  let list = await bridge.graphql(listQuery(!namesDenied), { since, first });
-  if (gen !== generation) return;
-  if (!namesDenied && channelSelectionForbidden(list && list.errors)) {
-    namesDenied = true;
-    list = await bridge.graphql(listQuery(false), { since, first });
-    if (gen !== generation) return;
-  }
-  showHint(namesDenied);
-  if (!list || !list.data || !list.data.requests) {
-    showProblems((list && list.errors) || [], true);
-    return;
-  }
-  let requests = nodesOf(list.data.requests).map(mapRequest).filter(Boolean);
-  const totals = readTotals(list.data);
-  const preliminary = buildStage({
-    requests,
-    now,
-    window: mode,
-    focusId: pinId,
-    pinned,
-    clientFilter,
-    limit: first,
-    totals,
-  });
-  const ids = executionIds(requests, preliminary.focusId);
-  let executionErrors = [];
-  if (ids.length) {
-    let result = await bridge.graphql(executionsQuery(ids, !namesDenied));
-    if (gen !== generation) return;
-    if (!namesDenied && channelSelectionForbidden(result && result.errors)) {
+  const previousRequests = prevRequests;
+  maybeRefreshStats(since, now, windowMode);
+
+  const withChannel = !namesDenied;
+  let [historyOutcome, inflight] = await Promise.all([
+    settle(() => bridge.graphql(historyQuery(withChannel), { since, first })),
+    fetchInflight(withChannel, gen, windowMode),
+  ]);
+  if (gen !== generation || windowMode !== mode || inflight.aborted) return;
+
+  let historyResponse = historyOutcome.ok ? historyOutcome.value : null;
+  let listErrors = [
+    ...errorsOf(historyResponse),
+    ...transportErrors(historyOutcome),
+    ...inflight.errors,
+    ...(inflight.error ? [{ message: inflight.error.message }] : []),
+  ];
+
+  if (withChannel) {
+    // Retry only the side whose own query hit the channel-object FORBIDDEN.
+    // A failed retry never replaces an original successful response.
+    const plan = channelRetryPlan(true, errorsOf(historyResponse), inflight.errors);
+    let historyRetryOk = !plan.history;
+    let inflightRetryOk = !plan.inflight;
+    if (plan.history) {
+      const retry = await settle(() => bridge.graphql(historyQuery(false), { since, first }));
+      if (gen !== generation || windowMode !== mode) return;
+      const retryResponse = retry.ok ? retry.value : null;
+      const retryErrors = [...errorsOf(retryResponse), ...transportErrors(retry)];
+      listErrors.push(...retryErrors);
+      if (retry.ok && connectionOf(retryResponse) && retryErrors.length === 0) {
+        historyRetryOk = true;
+        historyOutcome = retry;
+        historyResponse = retryResponse;
+      } else {
+        historyRetryOk = false;
+      }
+    }
+    if (plan.inflight) {
+      const retry = await fetchInflight(false, gen, windowMode);
+      if (gen !== generation || windowMode !== mode || retry.aborted) return;
+      listErrors.push(...retry.errors, ...(retry.error ? [{ message: retry.error.message }] : []));
+      if (retry.ok && !retry.error && retry.errors.length === 0) {
+        inflightRetryOk = true;
+        inflight = retry;
+      } else {
+        inflightRetryOk = false;
+      }
+    }
+    if ((plan.history || plan.inflight) && historyRetryOk && inflightRetryOk) {
       namesDenied = true;
       showHint(true);
-      result = await bridge.graphql(executionsQuery(ids, false));
-      if (gen !== generation) return;
     }
-    executionErrors = (result && result.errors) || [];
+  }
+
+  const inflightReady = inflight.ok;
+  const historyReady = Boolean(connectionOf(historyResponse));
+  if (!historyReady && !inflightReady) {
+    showProblems(listErrors, true);
+    return;
+  }
+
+  const inflightRequests = inflightReady ? inflight.nodes : [];
+  const historyRequests = historyReady
+    ? nodesOf(historyResponse.data.requests).map(mapRequest).filter(Boolean)
+    : [];
+  let requests = mergeRequests(inflightRequests, historyRequests);
+
+  // A request that was visible and live last cycle but is absent now needs a
+  // bounded terminal-state lookup. Only an explicit live answer keeps it
+  // active; unknown answers go stale for a short TTL; an explicit null exits.
+  const currentIds = new Set(requests.map((item) => item.id));
+  for (const id of [...staleTracking.keys()]) {
+    if (currentIds.has(id)) staleTracking.delete(id);
+  }
+  const candidates = new Set([
+    ...staleTracking.keys(),
+    ...retiredLiveIds(previousRequests, requests, lastVisibleTrackIds, selectedId),
+  ]);
+  const missing = [...candidates].filter((id) => !currentIds.has(id)).slice(0, TRACK_CAP + 1);
+  if (missing.length) {
+    const stateOutcome = await fetchTerminalStates(missing);
+    if (gen !== generation || windowMode !== mode) return;
+    if (stateOutcome.errors.length) listErrors = [...listErrors, ...stateOutcome.errors];
+    const keep = [];
+    for (const id of missing) {
+      const row = stateOutcome.rows.get(id) || { resolved: false, request: null };
+      const tracked = staleTracking.get(id);
+      const since = tracked ? tracked.since : Date.now();
+      const decision = backfillDecision(Date.now(), since, row.request, row.resolved);
+      if (decision === "active") {
+        staleTracking.delete(id);
+        keep.push(row.request);
+        continue;
+      }
+      if (decision === "terminal") {
+        staleTracking.delete(id);
+        lingering.set(id, { at: Date.now(), request: row.request });
+        keep.push(row.request);
+        armLinger();
+        continue;
+      }
+      if (decision === "gone") {
+        // node(id:) explicitly returned null: stop active tracking.
+        staleTracking.delete(id);
+        continue;
+      }
+      if (decision === "expire") {
+        staleTracking.delete(id);
+        continue;
+      }
+      const base = row.request || (tracked && tracked.request) || previousRequests.get(id);
+      if (base) {
+        staleTracking.set(id, {
+          since,
+          request: { ...base, status: "stale" },
+        });
+      } else {
+        staleTracking.delete(id);
+      }
+    }
+    if (keep.length) requests = mergeRequests(requests, keep);
+  }
+
+  const preview = buildStage({
+    requests,
+    now,
+    window: windowMode === "today" ? "today" : "live",
+    windowMs: windowMsFor(windowMode),
+    selectedId,
+    clientFilter,
+    limit: first,
+    totals: statsTotalsForWindow(statsMode, windowMode, latestTotals, statsLoaded),
+    historyCount: latestHistoryCount,
+    lingering: lingeringItems(),
+    stale: staleItems(),
+    inFlightTotal: clientFilter === "all" && statsWindowMatches(statsMode, mode) ? (latestTotals && latestTotals.inFlight) : null,
+    inFlightMore: clientFilter === "all" ? inflight.more : false,
+  });
+  const ids = visibleExecutionIds(preview.tracks, selectedId);
+  let executionErrors = [];
+  if (ids.length) {
+    let outcome = await settle(() => bridge.graphql(executionsQuery(ids, !namesDenied)));
+    if (gen !== generation || windowMode !== mode) return;
+    let result = outcome.ok ? outcome.value : null;
+    let resultErrors = errorsOf(result);
+    if (!namesDenied && hasForbidden(resultErrors)) {
+      const retry = await settle(() => bridge.graphql(executionsQuery(ids, false)));
+      if (gen !== generation || windowMode !== mode) return;
+      if (retry.ok && errorsOf(retry.value).length === 0) {
+        namesDenied = true;
+        showHint(true);
+        outcome = retry;
+        result = retry.value;
+        resultErrors = [];
+      } else {
+        outcome = retry;
+        result = retry.ok ? retry.value : null;
+        resultErrors = retry.ok && errorsOf(retry.value).length
+          ? errorsOf(retry.value)
+          : [{ message: retry.error ? retry.error.message : text.loadFailed }];
+      }
+    }
+    executionErrors = resultErrors;
     requests = attachExecutions(requests, ids, (result && result.data) || {});
+    // Linger carries its own request object; keep the final attempt and channel
+    // from this executions response instead of the state-only fallback.
+    const byId = new Map(requests.map((item) => [item.id, item]));
+    for (const [id, item] of lingering) {
+      const updated = byId.get(id);
+      if (updated) lingering.set(id, { ...item, request: updated });
+    }
   }
   if (gen !== generation) return;
-  showProblems([...(list.errors || []), ...executionErrors], false);
+
+  noteCompletions(requests, Date.now(), previousRequests);
+  showProblems([...listErrors, ...executionErrors], false);
   latestRequests = requests;
-  latestTotals = totals;
+  latestInFlightMore = inflight.more;
+  latestHistoryCount = historyRequests.length;
   fetchedLimit = first;
-  fetchedMode = mode;
   fetchedAt = now;
-  hasInFlight = (totals ? totals.inFlight > 0 : false)
-    || requests.some((item) => item.status === "pending" || item.status === "processing");
+  prevRequests = new Map(requests.map((item) => [item.id, item]));
+  hasInFlight = (latestTotals && latestTotals.inFlight > 0)
+    || requests.some((item) => isLiveStatus(item.status))
+    || [...lingering.values()].some((item) => isLiveStatus(item.request && item.request.status));
   render({ loaded: true });
   paintTick(true);
 }
 
-function listQuery(withChannel) {
-  const channel = withChannel ? "channel { id name }" : "channelID";
-  // Pending and processing requests stay in every window, including ones
-  // that started before $since. Finished rows are limited to the window.
-  const windowWhere = `{ or: [ { statusIn: [pending, processing] }, { createdAtGTE: $since } ] }`;
-  return `query LiveRequests($since: Time!, $first: Int!) {
-    requests(
-      first: $first
-      orderBy: { field: CREATED_AT, direction: DESC }
-      where: ${windowWhere}
-    ) {
-      totalCount
-      edges { node { ${LIST_FIELDS} ${channel} } }
-    }
-    inFlight: requests(first: 0, where: { statusIn: [pending, processing] }) { totalCount }
-    failed: requests(first: 0, where: { and: [ { status: failed }, { createdAtGTE: $since } ] }) { totalCount }
-  }`;
-}
-
-function readTotals(data) {
-  const requests = countOf(data && data.requests);
-  const inFlight = countOf(data && data.inFlight);
-  const failed = countOf(data && data.failed);
-  if (requests == null || inFlight == null || failed == null) return null;
-  return { requests, inFlight, failed };
-}
-
-function countOf(connection) {
-  const value = connection && connection.totalCount;
-  return Number.isInteger(value) && value >= 0 ? value : null;
-}
-
-function executionsQuery(ids, withChannel) {
-  const channel = withChannel ? "channel { id name }" : "channelID";
-  const selection = `id createdAt status modelID responseStatusCode errorMessage metricsLatencyMs metricsFirstTokenLatencyMs channelAPIKeyIndex channelAPIKeySuffix ${channel}`;
-  const fields = ids.map((id, index) => (
-    `r${index}: node(id: ${gqlString(id)}) { ... on Request { id executions(first: 8, orderBy: { field: CREATED_AT, direction: ASC }) { edges { node { ${selection} } } } } }`
-  ));
-  return `query LiveExecutions { ${fields.join(" ")} }`;
-}
-
-function executionIds(requests, focusId) {
-  const inflight = [];
-  const seen = new Set();
-  for (const item of requests) {
-    if (item.status !== "pending" && item.status !== "processing") continue;
-    if (seen.has(item.id)) continue;
-    seen.add(item.id);
-    inflight.push(item.id);
-  }
-  const ids = inflight.slice(0, 6);
-  if (focusId && !ids.includes(focusId)) {
-    if (ids.length < 6) ids.push(focusId);
-    else ids[ids.length - 1] = focusId;
-  }
-  return ids.filter(Boolean);
-}
-
-function sinceFor(which, now) {
-  if (which === "today") {
-    const start = new Date(now.getTime());
-    start.setHours(0, 0, 0, 0);
-    return start;
-  }
-  return new Date(now.getTime() - LIVE_MS);
-}
-
-function gqlString(value) {
-  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r")}"`;
-}
-
-function nodesOf(connection) {
-  const edges = connection && Array.isArray(connection.edges) ? connection.edges : [];
+async function fetchInflight(withChannel, gen, windowMode) {
+  let after = null;
+  let more = false;
   const nodes = [];
-  for (const edge of edges) {
-    if (edge && edge.node) nodes.push(edge.node);
+  const errors = [];
+  let lastResponse = null;
+  while (true) {
+    const outcome = await settle(() => bridge.graphql(inflightQuery(withChannel), { first: INFLIGHT_LIMIT, after }));
+    if (gen !== generation || windowMode !== mode) return { aborted: true, ok: false, nodes, more, errors };
+    if (!outcome.ok) return { ok: nodes.length > 0, error: outcome.error, nodes, more, errors };
+    lastResponse = outcome.value;
+    errors.push(...errorsOf(lastResponse));
+    const connection = connectionOf(lastResponse);
+    if (!connection) return { ok: nodes.length > 0, response: lastResponse, nodes, more, errors };
+    for (const node of nodesOf(connection)) {
+      const mapped = mapRequest(node);
+      if (mapped) nodes.push(mapped);
+    }
+    if (nodes.length >= INFLIGHT_BUDGET) {
+      more = pageInfoOf(connection).hasNext;
+      break;
+    }
+    const cursor = nextInflightCursor(connection, nodes.length, INFLIGHT_BUDGET);
+    if (!cursor || cursor === after) {
+      more = false;
+      break;
+    }
+    after = cursor;
+    more = true;
   }
-  return nodes;
+  return { ok: true, response: lastResponse, nodes, more, errors };
 }
 
-function channelRef(node) {
-  if (node && node.channel && node.channel.id) {
-    return { id: node.channel.id, name: node.channel.name || node.channel.id };
+async function fetchTerminalStates(ids) {
+  const outcome = await settle(() => bridge.graphql(requestStateQuery(ids, !namesDenied)));
+  let result = outcome.ok ? outcome.value : null;
+  let errors = [...errorsOf(result), ...transportErrors(outcome)];
+  if (!namesDenied && hasForbidden(errors)) {
+    const retry = await settle(() => bridge.graphql(requestStateQuery(ids, false)));
+    const retryResult = retry.ok ? retry.value : null;
+    const retryErrors = [...errorsOf(retryResult), ...transportErrors(retry)];
+    errors = [...errors, ...retryErrors];
+    if (retry.ok && retryErrors.length === 0) {
+      namesDenied = true;
+      showHint(true);
+      result = retryResult;
+    }
   }
-  if (node && node.channelID) return { id: node.channelID, name: node.channelID };
-  return null;
+  return { rows: readStateNodes(result && result.data, ids), errors };
 }
 
-function mapRequest(node) {
-  if (!node || !node.id) return null;
-  return {
-    id: node.id,
-    createdAt: node.createdAt,
-    status: String(node.status || "").toLowerCase(),
-    modelID: node.modelID || "",
-    stream: Boolean(node.stream),
-    source: node.source || "",
-    userAgent: node.userAgent || "",
-    metricsLatencyMs: node.metricsLatencyMs,
-    metricsFirstTokenLatencyMs: node.metricsFirstTokenLatencyMs,
-    apiKey: node.apiKey && node.apiKey.id ? {
-      id: node.apiKey.id,
-      name: node.apiKey.name || "",
-      status: String(node.apiKey.status || "").toLowerCase(),
-      type: node.apiKey.type || "",
-    } : null,
-    channel: channelRef(node),
-  };
+function noteCompletions(requests, at, previousRequests) {
+  for (const item of requests) {
+    const status = String(item.status || "").toLowerCase();
+    const before = previousRequests.get ? previousRequests.get(item.id) : null;
+    if (before && isLiveStatus(before.status) && !isLiveStatus(status)) {
+      lingering.set(item.id, { at, request: item });
+      armLinger();
+    }
+  }
 }
 
-function mapExecution(node) {
-  return {
-    id: node.id,
-    createdAt: node.createdAt,
-    status: String(node.status || "").toLowerCase(),
-    modelID: node.modelID || "",
-    responseStatusCode: node.responseStatusCode,
-    errorMessage: node.errorMessage || "",
-    metricsLatencyMs: node.metricsLatencyMs,
-    metricsFirstTokenLatencyMs: node.metricsFirstTokenLatencyMs,
-    channelAPIKeyIndex: node.channelAPIKeyIndex,
-    channelAPIKeySuffix: node.channelAPIKeySuffix || "",
-    channel: channelRef(node),
-  };
+function armLinger() {
+  clearTimeout(lingerTimer);
+  lingerTimer = setTimeout(() => {
+    lingerTimer = 0;
+    if (loadedOnce) render();
+  }, LINGER_MS + 150);
 }
 
-function attachExecutions(requests, ids, data) {
-  const byId = new Map(requests.map((item) => [item.id, { ...item }]));
-  ids.forEach((id, index) => {
-    const node = data[`r${index}`];
-    const current = byId.get(id);
-    if (!current || !node) return;
-    current.executions = nodesOf(node.executions).map(mapExecution);
-  });
-  return [...byId.values()];
+function pruneLingering() {
+  const wall = Date.now();
+  for (const [id, item] of lingering) {
+    if (wall - item.at >= LINGER_MS) lingering.delete(id);
+  }
 }
 
-function channelSelectionForbidden(errors) {
-  if (!Array.isArray(errors)) return false;
-  return errors.some((error) => {
-    const message = String((error && error.message) || "").toLowerCase();
-    const path = Array.isArray(error && error.path) ? error.path.map((part) => String(part).toLowerCase()) : [];
-    const aboutChannel = path.includes("channel") || message.includes("channel") || message.includes("read_channels");
-    const code = error && error.extensions && error.extensions.code;
-    const forbidden = code === "FORBIDDEN" || message.includes("forbidden") || message.includes("permission") || message.includes("read_channels");
-    return aboutChannel && forbidden;
+function lingeringItems() {
+  return [...lingering].map(([id, item]) => ({ id, doneAt: item.at, request: item.request }));
+}
+
+function staleItems() {
+  const now = Date.now();
+  for (const [id, item] of staleTracking) {
+    if (backfillDecision(now, item.since, null, false) === "expire") staleTracking.delete(id);
+  }
+  return [...staleTracking.values()].map((item) => item.request).filter(Boolean);
+}
+
+function maybeRefreshStats(since, now, windowMode) {
+  if (!statsDue(statsAt, now)) return;
+  statsAt = now.getTime();
+  const token = ++statsToken;
+  const version = statsVersion;
+  Promise.resolve().then(() => bridge.graphql(statsQuery(), { since })).then((response) => {
+    if (!statsAccept(token, statsToken, version, statsVersion)) return;
+    const totals = readTotals(response && response.data);
+    if (!totals) {
+      statsError = true;
+      render();
+      return;
+    }
+    latestTotals = totals;
+    statsMode = windowMode;
+    statsLoaded = true;
+    statsError = false;
+    render();
+  }).catch(() => {
+    if (!statsAccept(token, statsToken, version, statsVersion)) return;
+    statsError = true;
+    render();
   });
 }
 
@@ -572,7 +836,7 @@ function showHint(denied) {
 
 function showProblems(errors, failed) {
   const messages = (errors || [])
-    .filter((error) => error && !channelSelectionForbidden([error]))
+    .filter((error) => error && !(namesDenied && (isForbiddenError(error) || channelSelectionForbidden([error]))))
     .map((error) => error.message)
     .filter(Boolean);
   if (!messages.length) {
@@ -593,58 +857,87 @@ function showError(error) {
 
 function render(options) {
   const now = fetchedAt || new Date();
+  pruneLingering();
   const view = buildStage({
     requests: latestRequests,
     now,
-    window: mode,
-    focusId: pinId,
-    pinned,
+    window: mode === "today" ? "today" : "live",
+    windowMs: windowMsFor(mode),
+    selectedId,
     clientFilter,
     limit: fetchedLimit,
-    totals: mode === fetchedMode ? latestTotals : null,
+    totals: statsTotalsForWindow(statsMode, mode, latestTotals, statsLoaded),
+    historyCount: latestHistoryCount,
+    lingering: lingeringItems(),
+    stale: staleItems(),
+    inFlightTotal: clientFilter === "all" && statsWindowMatches(statsMode, mode) && latestTotals
+      ? latestTotals.inFlight
+      : null,
+    inFlightMore: clientFilter === "all" ? latestInFlightMore : false,
   });
-  if (pinned && view.focusId !== pinId) {
-    pinned = false;
-    pinId = "";
+  if (selectedId && view.focusId !== selectedId) selectedId = "";
+  lastVisibleTrackIds = view.tracks.filter((track) => track.live).map((track) => track.id);
+  for (const track of view.tracks) {
+    if (track.failed && track.lingering && track.rowId) flashes.set(track.rowId, Date.now() + 1600);
   }
-  let event = null;
-  if (options && options.loaded) {
-    loadedOnce = true;
-    event = takeMotion(latestRequests, view);
-  }
-  if (event && event.type === "switch") flashes.set(event.fromRow, Date.now() + 1600);
+  if (options && options.loaded) loadedOnce = true;
   paintChrome(view);
-  paintStage(view, event);
+  paintStage(view);
   paintLog(view);
 }
 
 function paintChrome(view) {
   fillFilter(view.availableClients);
   updatedEl.textContent = fetchedAt ? text.updated(formatTime(fetchedAt, locale)) : text.loading;
-  const empty = view.shown === 0;
+  const empty = view.shown === 0 && view.tracks.length === 0;
   emptyEl.hidden = !empty;
   emptyText.textContent = view.windowCount === 0
-    ? (mode === "today" ? text.emptyToday : text.emptyLive)
-    : (view.note && view.note.kind === "sample" ? text.emptyFilterSample(view.note.count) : text.emptyFilter);
-  paintStats(view, empty);
+    ? text.emptyWindow(windowLabelFor(mode))
+    : (view.scope === "sample" ? text.emptyFilterSample(view.pageCount) : text.emptyFilter);
+  paintStats(view);
+  paintOverviewNote(view, empty);
   paintFocusBar(view, empty);
-  logPanel.hidden = empty;
-  logHint.textContent = pinned ? text.pinnedHint : text.pinHint;
+  logPanel.hidden = view.log.length === 0;
+  logHint.textContent = selectedId ? text.pinnedHint : text.pinHint;
 }
 
-function paintStats(view, empty) {
-  statsBlock.hidden = empty;
-  if (empty) return;
-  const note = view.note;
-  sampleNoteEl.hidden = !note;
-  sampleNoteEl.textContent = note
-    ? (note.kind === "list" ? text.listSample(note.count) : text.sampleStats(note.count))
-    : "";
+function paintOverviewNote(view, empty) {
+  const parts = [];
+  if (!empty && view.staticOverview) parts.push(text.staticOverview);
+  if (!empty && view.inFlightTruncated) {
+    parts.push(text.inFlightLimited(view.inFlightLoaded, view.inFlightTotal));
+  } else if (!empty && view.inFlightMore) {
+    parts.push(text.inFlightMore(view.inFlightLoaded));
+  }
+  if (!empty && view.trackOverflow > 0) {
+    parts.push(view.inFlightMore ? text.trackOverflowLower(view.trackOverflow) : text.trackOverflow(view.trackOverflow));
+  }
+  overviewNote.hidden = !parts.length;
+  overviewNote.textContent = parts.join(" ");
+}
+
+// Counts have their own lifecycle. A successful stats response stays visible
+// even when the first list request failed and returned no rows.
+function paintStats(view) {
+  const show = statsVisible(statsLoaded, view.shown);
+  statsBlock.hidden = !show;
+  if (!show) return;
+  sampleNoteEl.textContent = statsError && !statsLoaded ? text.statsUnavailable : statsNote(view);
   countsEl.replaceChildren(
-    stat(text.requests, view.counts.requests, ""),
-    stat(text.inFlight, view.counts.inFlight, view.counts.inFlight ? "busy" : ""),
-    stat(text.failed, view.counts.failed, view.counts.failed ? "bad" : ""),
+    stat(view.scope === "window" ? text.requests : text.listLatest, view.counts.requests, ""),
+    stat(text.inFlightNow, view.counts.inFlight, view.counts.inFlight ? "busy" : ""),
+    stat(text.failedWindow, view.counts.failed, view.counts.failed ? "bad" : ""),
   );
+}
+
+function statsNote(view) {
+  if (view.scope === "window") {
+    const total = view.windowTotal == null ? view.pageCount : view.windowTotal;
+    if (total > view.pageCount) return text.statsWindow(total, view.pageCount);
+    return text.statsWindowComplete(total);
+  }
+  if (view.scope === "list") return text.statsList(view.pageCount);
+  return text.statsSample(view.pageCount);
 }
 
 function stat(label, value, state) {
@@ -670,8 +963,7 @@ function paintFocusBar(view, empty) {
     return;
   }
   focusBar.style.setProperty("--client", focus.hue);
-  const live = focus.status === "pending" || focus.status === "processing";
-  focusTag.textContent = pinned ? text.tagPinned : (live ? text.tagLive : text.tagLatest);
+  focusTag.textContent = text.trackTag(focus.trackIndex);
   const line = statusLine(view, locale).replace(/[。.]$/, "");
   summaryEl.textContent = line;
   summaryEl.title = line;
@@ -711,42 +1003,30 @@ function fillFilter(clients) {
   filterEl.value = current;
 }
 
-function paintStage(view, event) {
-  const empty = view.shown === 0;
+function paintStage(view) {
+  const empty = view.shown === 0 && view.tracks.length === 0;
   stage.hidden = empty;
   stageScroll.hidden = empty;
   if (empty) {
-    paintedFocus = "";
-    playToken += 1;
-    cancelAnimationFrame(rafId);
-    flying = false;
-    hold = null;
-    clearDots();
     wires.replaceChildren();
     return;
   }
   drawColumns(view);
   drawWires(view);
-  const focusChanged = (view.focusId || "") !== paintedFocus;
-  paintedFocus = view.focusId || "";
-  if (event) play(event, view);
-  else {
-    if (focusChanged && flying) stopFlight();
-    if (!flying) syncHold(view);
-  }
+  drawTracks(view);
 }
 
 function drawColumns(view) {
-  colClients.replaceChildren(columnLabel(text.colClient, view.clients.length));
+  colClients.replaceChildren(columnLabel(text.colClient, view.clients.length, view.nodeOverflow.clients));
   for (const client of view.clients) colClients.append(clientCard(client, view));
-  colKeys.replaceChildren(columnLabel(text.colKey, view.keys.length));
+  colKeys.replaceChildren(columnLabel(text.colKey, view.keys.length, view.nodeOverflow.keys));
   for (const key of view.keys) colKeys.append(keyCard(key, view));
   colHub.replaceChildren(columnLabel(""), hubCard(view));
-  colChannels.replaceChildren(columnLabel(text.colChannel, view.channels.length));
+  colChannels.replaceChildren(columnLabel(text.colChannel, view.channels.length, view.nodeOverflow.channels));
   for (const row of view.channels) colChannels.append(channelCard(row, view));
 }
 
-function columnLabel(value, count) {
+function columnLabel(value, count, overflow) {
   const label = document.createElement("div");
   label.className = "col-label";
   label.textContent = value;
@@ -755,6 +1035,13 @@ function columnLabel(value, count) {
     badge.className = "col-count";
     badge.textContent = String(count);
     label.append(badge);
+  }
+  if (overflow > 0) {
+    const more = document.createElement("span");
+    more.className = "col-more";
+    more.textContent = `+${overflow}`;
+    more.title = text.moreNodes(overflow);
+    label.append(more);
   }
   return label;
 }
@@ -813,7 +1100,9 @@ function channelCard(row, view) {
   card.className = `channel ${row.kind}`;
   if (flashing(row.rowId)) card.classList.add("flash-failed");
   card.dataset.node = row.nodeId;
-  if (row.kind === "answering" && view.focus) card.style.setProperty("--client", view.focus.hue);
+  const selectedTrack = view.focus && row.tracks.some((track) => track.id === view.focus.id);
+  const hue = selectedTrack ? view.focus.hue : (row.tracks.length ? row.tracks[0].hue : "");
+  if (hue && (row.kind === "answering" || row.tracks.length)) card.style.setProperty("--client", hue);
   const main = document.createElement("div");
   main.className = "channel-main";
   const title = document.createElement("div");
@@ -842,6 +1131,25 @@ function channelCard(row, view) {
     error.textContent = row.errorMessage;
     error.title = row.errorMessage;
     main.append(error);
+  }
+  if (row.tracks.length) {
+    const chips = document.createElement("div");
+    chips.className = "track-chips";
+    for (const track of row.tracks) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "track-chip";
+      chip.dataset.trackId = track.id;
+      chip.style.setProperty("--track", track.hue);
+      chip.classList.toggle("live", track.live);
+      chip.classList.toggle("failed", track.failed);
+      chip.classList.toggle("selected", Boolean(view.focus && view.focus.id === track.id));
+      chip.textContent = String(track.index);
+      chip.title = text.trackLabel(track.index);
+      chip.setAttribute("aria-label", text.trackLabel(track.index));
+      chips.append(chip);
+    }
+    main.append(chips);
   }
   const status = badge(row.kind, channelStatusText(row.kind, locale, {
     latencyMs: row.latencyMs,
@@ -897,6 +1205,7 @@ function requestStatus(status) {
   if (status === "completed") return text.statusCompleted;
   if (status === "failed") return text.statusFailed;
   if (status === "canceled") return text.statusCanceled;
+  if (status === "stale") return text.statusStale;
   return status || "";
 }
 
@@ -932,9 +1241,9 @@ function paintLog(view) {
     const tr = document.createElement("tr");
     tr.dataset.id = row.id;
     tr.tabIndex = 0;
-    tr.style.setProperty("--client", row.client.hue);
-    if (pinned && pinId === row.id) {
-      tr.classList.add("pinned");
+    tr.style.setProperty("--client", row.hue || row.client.hue);
+    if (selectedId && selectedId === row.id) {
+      tr.classList.add("selected");
       tr.setAttribute("aria-current", "true");
     }
     if (seenRows && !seenRows.has(row.id)) tr.classList.add("fresh");
@@ -972,296 +1281,121 @@ function restartAnimation(el, className) {
   el.classList.add(className);
 }
 
-function takeMotion(requests, view) {
-  const snap = new Map();
-  for (const item of requests) {
-    snap.set(item.id, {
-      status: String(item.status || "").toLowerCase(),
-      rowId: currentRowId(item),
-    });
-  }
-  if (!primed) {
-    primed = true;
-    prevSnap = snap;
-    return firstEvent(view);
-  }
-  const previous = prevSnap;
-  prevSnap = snap;
-  return diffEvent(previous, snap, view);
+function drawWires(view) {
+  const origin = stage.getBoundingClientRect();
+  syncSvg(wires, origin);
+  wires.replaceChildren();
+  for (const wire of view.wires.faint) drawLine(wire.from, wire.to, origin, "wire-faint");
 }
 
-function firstEvent(view) {
-  if (!view.focus) return null;
-  if (view.focus.status === "pending" || view.focus.status === "processing") return { type: "out" };
-  return null;
+function drawLine(fromId, toId, origin, className) {
+  const from = pointOf(fromId, origin);
+  const to = pointOf(toId, origin);
+  if (!from || !to) return;
+  const start = [from.right, from.cy];
+  const end = [to.left, to.cy];
+  const [c1, c2] = wireBends(start, end);
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", `M${start[0]} ${start[1]} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${end[0]} ${end[1]}`);
+  path.setAttribute("class", className);
+  wires.append(path);
 }
 
-function diffEvent(previous, snap, view) {
-  const focus = view.focus;
-  if (!focus) return null;
-  const next = snap.get(focus.id);
-  if (!next) return null;
-  const prev = previous && previous.get(focus.id);
-  const live = next.status === "pending" || next.status === "processing";
-  if (!prev) return live ? { type: "out" } : null;
-  const was = prev.status === "pending" || prev.status === "processing";
-  if (!was && live) return { type: "out" };
-  const motion = rowMotion(prev.rowId, next.rowId);
-  if (was && live && motion === "switch") {
-    return { type: "switch", fromRow: prev.rowId, toRow: next.rowId };
+// Every visible request gets its own path. A shared client/key/channel keeps
+// the same four columns, while lane offsets and endpoint dots keep several
+// requests on the same route visually separate.
+function drawTracks(view) {
+  const origin = stage.getBoundingClientRect();
+  const tracks = view.tracks || [];
+  const total = tracks.length;
+  const order = tracks.map((track, index) => ({ track, index }));
+  if (view.focus) {
+    // Draw the selected lane last so it stays above dimmed neighbors.
+    order.sort((left, right) => Number(left.track.id === view.focus.id) - Number(right.track.id === view.focus.id));
   }
-  if (was && live && motion === "assign") return { type: "assign", toRow: next.rowId };
-  if (was && next.status === "completed") return { type: "back", style: "hollow", fromRow: prev.rowId };
-  if (was && (next.status === "failed" || next.status === "canceled")) {
-    return { type: "back", style: "red", fromRow: prev.rowId };
-  }
-  return null;
-}
-
-function play(event, view) {
-  playToken += 1;
-  const token = playToken;
-  cancelAnimationFrame(rafId);
-  const hue = view.focus ? view.focus.hue : "#64748b";
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    flying = false;
-    clearDots();
-    hold = event.type === "back" ? null : { nodeId: destinationId(event, view), hue };
-    return;
-  }
-  if (event.type === "out") {
-    runPath(outIds(view), { token, kind: "filled", hue, duration: OUT_MS, hold: true });
-    return;
-  }
-  if (event.type === "assign") {
-    runPath(["hub", `channel:${event.toRow}`], { token, kind: "filled", hue, duration: SWITCH_MS, hold: true });
-    return;
-  }
-  if (event.type === "back") {
-    hold = null;
-    runPath(backIds(view, event.fromRow), {
-      token,
-      kind: event.style === "hollow" ? "hollow" : "red",
-      hue,
-      duration: BACK_MS,
-      hold: false,
-    });
-    return;
-  }
-  runPath([`channel:${event.fromRow}`, "hub"], {
-    token,
-    kind: "red",
-    hue,
-    duration: SWITCH_MS,
-    hold: false,
-    then() {
-      if (token !== playToken) return;
-      runPath(["hub", `channel:${event.toRow}`], { token, kind: "filled", hue, duration: SWITCH_MS, hold: true });
-    },
-  });
-}
-
-function stopFlight() {
-  playToken += 1;
-  cancelAnimationFrame(rafId);
-  flying = false;
-  clearDots();
-}
-
-function destinationId(event, view) {
-  if (event.type === "switch" || event.type === "assign") return `channel:${event.toRow}`;
-  if (view.focus && view.focus.rowId) return `channel:${view.focus.rowId}`;
-  return "hub";
-}
-
-function outIds(view) {
-  const focus = view.focus;
-  const ids = [`client:${focus.clientId}`, `key:${focus.keyId}`, "hub"];
-  if (focus.rowId) ids.push(`channel:${focus.rowId}`);
-  return ids;
-}
-
-function backIds(view, fromRow) {
-  const focus = view.focus;
-  const ids = [];
-  const channel = fromRow || focus.rowId;
-  if (channel) ids.push(`channel:${channel}`);
-  ids.push("hub", `key:${focus.keyId}`, `client:${focus.clientId}`);
-  return ids;
-}
-
-function runPath(ids, options) {
-  const nodes = nodesFrom(ids);
-  clearDots();
-  if (nodes.length < 2) {
-    flying = false;
-    if (options.hold && nodes[0]) {
-      hold = { nodeId: nodes[0].nodeId, hue: options.hue };
-      placeHold();
+  for (const { track, index } of order) {
+    const lane = laneOffsetFor(index, total);
+    const nodeIds = [`client:${track.clientId}`, `key:${track.keyId}`, "hub"];
+    if (track.rowId) nodeIds.push(`channel:${track.rowId}`);
+    const nodes = [];
+    for (const nodeId of nodeIds) {
+      const point = pointOf(nodeId, origin);
+      if (point) nodes.push(point);
     }
-    if (options.then) options.then();
-    return;
+    if (nodes.length < 2) continue;
+    const selected = Boolean(view.focus && view.focus.id === track.id);
+    const dim = Boolean(view.focus && !selected);
+    const classes = ["track"];
+    if (track.live) classes.push("live");
+    if (track.failed) classes.push("failed");
+    if (track.stale) classes.push("stale");
+    if (track.static) classes.push("static");
+    if (track.lingering) classes.push("linger");
+    if (selected) classes.push("selected");
+    if (dim) classes.push("dim");
+    const d = trackPath(nodes, lane);
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", d);
+    path.setAttribute("class", classes.join(" "));
+    path.setAttribute("stroke", track.hue);
+    if (track.lingering && Number.isFinite(track.doneAt)) {
+      const age = Math.max(0, Date.now() - track.doneAt);
+      path.style.animationDelay = `-${age}ms`;
+    }
+    const title = document.createElementNS(SVG_NS, "title");
+    title.textContent = trackTitle(track);
+    path.append(title);
+    wires.append(path);
+
+    const hit = document.createElementNS(SVG_NS, "path");
+    hit.setAttribute("d", d);
+    hit.setAttribute("class", "track-hit");
+    hit.setAttribute("data-track-id", track.id);
+    hit.setAttribute("tabindex", "0");
+    hit.setAttribute("role", "button");
+    hit.setAttribute("aria-label", trackTitle(track));
+    wires.append(hit);
+
+    const end = nodes[nodes.length - 1];
+    const dot = document.createElementNS(SVG_NS, "circle");
+    dot.setAttribute("class", selected ? "track-end selected" : (dim ? "track-end dim" : "track-end"));
+    dot.setAttribute("cx", String(end.left - 4));
+    dot.setAttribute("cy", String(end.cy + lane));
+    dot.setAttribute("r", selected ? "4" : "2.6");
+    dot.setAttribute("fill", track.hue);
+    wires.append(dot);
   }
-  const route = routeThrough(nodes, options.hold);
-  flying = true;
-  const dot = makeDot(options.kind, options.hue);
-  dot.setAttribute("cx", String(route.points[0][0]));
-  dot.setAttribute("cy", String(route.points[0][1]));
-  dots.append(dot);
-  const started = performance.now();
-  let reached = 0;
-  const step = (now) => {
-    if (options.token !== playToken) {
-      dot.remove();
-      return;
-    }
-    // A frame timestamp can be earlier than performance.now() from when this
-    // flight was scheduled. Negative elapsed used to compute index -1.
-    const elapsed = Number.isFinite(now) ? Math.max(0, now - started) : 0;
-    const duration = options.duration > 0 ? options.duration : 1;
-    const progress = Math.min(1, elapsed / duration);
-    const at = easeInOut(progress) * route.length;
-    const [x, y] = pointAlong(route, at);
-    dot.setAttribute("cx", String(x));
-    dot.setAttribute("cy", String(y));
-    while (reached < route.marks.length && at >= route.marks[reached].at - 1e-6) {
-      pulse(route.marks[reached].el);
-      reached += 1;
-    }
-    if (progress < 1) {
-      rafId = requestAnimationFrame(step);
-      return;
-    }
-    for (; reached < route.marks.length; reached += 1) pulse(route.marks[reached].el);
-    flying = false;
-    if (options.hold) {
-      hold = { nodeId: nodes[nodes.length - 1].nodeId, fromId: nodes[nodes.length - 2].nodeId, hue: options.hue };
-      dot.classList.add("dot-hold");
-    } else {
-      dot.remove();
-    }
-    if (options.then) options.then();
-  };
-  rafId = requestAnimationFrame(step);
 }
 
-function easeInOut(t) {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+function trackTitle(track) {
+  const parts = [
+    text.trackLabel(track.trackIndex),
+    clientLabel({ id: track.clientId, name: track.clientName }, locale),
+    track.modelID,
+    requestStatus(track.status),
+    track.channelName || text.noChannel,
+  ];
+  return parts.filter(Boolean).join(" · ");
 }
 
-// routeThrough lays the way a dot flies, as magpie's routing stage does: out
-// of the first node's side, along each wire, over each node it passes on a
-// gentle arc, and into the last one — or, when it will wait there, to rest on
-// the wire just short of it.
-function routeThrough(nodes, resting) {
-  const points = [];
-  const marks = [];
-  const lengths = [0];
-  const push = (point) => {
-    const last = points[points.length - 1];
-    if (last) lengths.push(lengths[lengths.length - 1] + Math.hypot(point[0] - last[0], point[1] - last[1]));
-    points.push(point);
-  };
-  const sample = (p0, p1, p2, p3, skipFirst) => {
-    for (let index = skipFirst ? 1 : 0; index <= 24; index += 1) push(cubicAt(p0, p1, p2, p3, index / 24));
-  };
+function trackPath(nodes, lane) {
+  let d = "";
   for (let index = 0; index < nodes.length - 1; index += 1) {
     const from = nodes[index];
     const to = nodes[index + 1];
-    const forward = to.cx >= from.cx;
-    const start = [forward ? from.right : from.left, from.cy];
-    const end = [forward ? to.left : to.right, to.cy];
-    if (index > 0) {
-      const enter = points[points.length - 1];
-      const span = start[0] - enter[0];
-      const bow = Math.min(14, Math.abs(span) * 0.12);
-      sample(enter, [enter[0] + span * 0.38, enter[1] - bow], [start[0] - span * 0.38, start[1] - bow], start, true);
-    }
+    const start = [from.right, from.cy + lane];
+    const end = [to.left, to.cy + lane];
     const [c1, c2] = wireBends(start, end);
-    sample(start, c1, c2, end, index > 0);
-    marks.push({ at: lengths[lengths.length - 1], el: to.el });
+    if (index === 0) d += `M${start[0]} ${start[1]}`;
+    else d += ` L${start[0]} ${start[1]}`;
+    d += ` C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${end[0]} ${end[1]}`;
   }
-  // A dot that will wait stops HOLD_GAP short along the wire itself, so it
-  // rests on the curve rather than beside it.
-  const total = lengths[lengths.length - 1];
-  return { points, lengths, marks, length: resting ? Math.max(0, total - HOLD_GAP) : total };
+  return d;
 }
 
-function cubicAt(p0, p1, p2, p3, t) {
-  const u = 1 - t;
-  const a = u * u * u;
-  const b = 3 * u * u * t;
-  const c = 3 * u * t * t;
-  const d = t * t * t;
-  return [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]];
-}
-
-function pointAlong(route, at) {
-  const { points, lengths } = route;
-  if (at <= 0) return points[0];
-  let low = 0;
-  let high = lengths.length - 1;
-  if (at >= lengths[high]) return points[high];
-  while (high - low > 1) {
-    const mid = (low + high) >> 1;
-    if (lengths[mid] <= at) low = mid;
-    else high = mid;
-  }
-  const span = lengths[high] - lengths[low] || 1;
-  const local = (at - lengths[low]) / span;
-  return [
-    points[low][0] + (points[high][0] - points[low][0]) * local,
-    points[low][1] + (points[high][1] - points[low][1]) * local,
-  ];
-}
-
-// A wire is an S from one node's side to the next's, its bends halfway.
 function wireBends(start, end) {
   const mid = (start[0] + end[0]) / 2;
   return [[mid, start[1]], [mid, end[1]]];
-}
-
-function syncHold(view) {
-  if (flying) return;
-  const focus = view.focus;
-  const live = focus && (focus.status === "pending" || focus.status === "processing");
-  if (!live || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    hold = null;
-    clearDots();
-    return;
-  }
-  hold = focus.rowId
-    ? { nodeId: `channel:${focus.rowId}`, fromId: "hub", hue: focus.hue }
-    : { nodeId: "hub", fromId: `key:${focus.keyId}`, hue: focus.hue };
-  placeHold();
-}
-
-function placeHold() {
-  if (!hold || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  const nodes = nodesFrom(hold.fromId ? [hold.fromId, hold.nodeId] : [hold.nodeId]);
-  clearDots();
-  const to = nodes[nodes.length - 1];
-  if (!to || to.nodeId !== hold.nodeId) return;
-  let at = [to.left - HOLD_GAP, to.cy];
-  if (nodes.length === 2) {
-    const route = routeThrough(nodes, true);
-    at = pointAlong(route, route.length);
-  }
-  const dot = makeDot("filled", hold.hue);
-  dot.classList.add("dot-hold");
-  dot.setAttribute("cx", String(at[0]));
-  dot.setAttribute("cy", String(at[1]));
-  dots.append(dot);
-}
-
-function nodesFrom(ids) {
-  const origin = stage.getBoundingClientRect();
-  const nodes = [];
-  for (const id of ids) {
-    const found = pointOf(id, origin);
-    if (found) nodes.push({ ...found, nodeId: id });
-  }
-  return nodes;
 }
 
 function pointOf(nodeId, origin) {
@@ -1284,62 +1418,10 @@ function pointOf(nodeId, origin) {
   };
 }
 
-function drawWires(view) {
-  const origin = stage.getBoundingClientRect();
-  syncSvg(wires, origin);
-  syncSvg(dots, origin);
-  wires.replaceChildren();
-  const live = view.focus && (view.focus.status === "pending" || view.focus.status === "processing");
-  for (const wire of view.wires.faint) drawLine(wire.from, wire.to, origin, "wire-faint", "");
-  if (view.focus) {
-    for (const wire of view.wires.focus) {
-      drawLine(wire.from, wire.to, origin, live ? "wire-focus wire-live" : "wire-focus", view.focus.hue);
-    }
-  }
-}
-
-function drawLine(fromId, toId, origin, className, hue) {
-  const from = pointOf(fromId, origin);
-  const to = pointOf(toId, origin);
-  if (!from || !to) return;
-  const start = [from.right, from.cy];
-  const end = [to.left, to.cy];
-  const [c1, c2] = wireBends(start, end);
-  const path = document.createElementNS(SVG_NS, "path");
-  path.setAttribute("d", `M${start[0]} ${start[1]} C${c1[0]} ${c1[1]} ${c2[0]} ${c2[1]} ${end[0]} ${end[1]}`);
-  path.setAttribute("class", className);
-  if (hue) path.setAttribute("stroke", hue);
-  wires.append(path);
-}
-
 function syncSvg(svg, rect) {
   const width = Math.max(1, rect.width);
   const height = Math.max(1, rect.height);
   svg.setAttribute("width", String(width));
   svg.setAttribute("height", String(height));
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-}
-
-function makeDot(kind, hue) {
-  const dot = document.createElementNS(SVG_NS, "circle");
-  dot.setAttribute("class", "flight");
-  dot.setAttribute("r", kind === "filled" ? "5" : "4.5");
-  const glow = kind === "red" ? "var(--destructive, #b42318)" : (hue || "currentColor");
-  dot.style.setProperty("--glow", `color-mix(in srgb, ${glow} 60%, transparent)`);
-  if (kind === "filled") {
-    dot.setAttribute("fill", hue || "currentColor");
-    return dot;
-  }
-  dot.setAttribute("fill", "var(--card, #ffffff)");
-  dot.setAttribute("stroke-width", "2.25");
-  dot.setAttribute("stroke", kind === "hollow" ? (hue || "currentColor") : "var(--destructive, #b42318)");
-  return dot;
-}
-
-function pulse(el) {
-  if (el) restartAnimation(el, "arrive");
-}
-
-function clearDots() {
-  dots.replaceChildren();
 }
